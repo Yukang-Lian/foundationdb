@@ -387,7 +387,8 @@ ACTOR Future<std::vector<std::string>> listContainers_impl(std::string baseURL, 
 			// Create a dummy container to parse the backup-specific parameters from the URL and get a final bucket name
 			BackupContainerS3BlobStore dummy(bstore, "dummy", backupParams, {}, true);
 
-			std::vector<std::string> results = wait(BackupContainerS3BlobStore::listURLs(bstore, dummy.getBucket()));
+			std::vector<std::string> results =
+			    wait(BackupContainerS3BlobStore::listURLs(bstore, dummy.getBucket(), dummy.getPrefix()));
 			return results;
 		}
 		// TODO: Enable this when Azure backups are ready

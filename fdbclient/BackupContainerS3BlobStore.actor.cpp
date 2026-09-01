@@ -22,6 +22,7 @@
 #include "fdbclient/BackupContainerS3BlobStore.h"
 #include "fdbrpc/AsyncFileEncrypted.h"
 #include "fdbrpc/AsyncFileReadAhead.actor.h"
+#include "flow/UnitTest.h"
 #include "flow/actorcompiler.h" // This must be the last #include.
 
 class BackupContainerS3BlobStoreImpl {
@@ -33,13 +34,19 @@ public:
 	// number of slashes so the backup names are kept in a separate folder tree from their actual data.
 	static const std::string INDEXFOLDER;
 
-	ACTOR static Future<std::vector<std::string>> listURLs(Reference<S3BlobStoreEndpoint> bstore, std::string bucket) {
+	ACTOR static Future<std::vector<std::string>> listURLs(Reference<S3BlobStoreEndpoint> bstore,
+	                                                       std::string bucket,
+	                                                       std::string prefix) {
 		state std::string basePath = INDEXFOLDER + '/';
+		state std::string params = format("bucket=%s", bucket.c_str());
+		if (!prefix.empty()) {
+			basePath = prefix + "/" + basePath;
+			params += format("&prefix=%s", prefix.c_str());
+		}
 		S3BlobStoreEndpoint::ListResult contents = wait(bstore->listObjects(bucket, basePath));
 		std::vector<std::string> results;
 		for (const auto& f : contents.objects) {
-			results.push_back(
-			    bstore->getResourceURL(f.name.substr(basePath.size()), format("bucket=%s", bucket.c_str())));
+			results.push_back(bstore->getResourceURL(f.name.substr(basePath.size()), params));
 		}
 		return results;
 	}
@@ -132,11 +139,15 @@ const std::string BackupContainerS3BlobStoreImpl::DATAFOLDER = "data";
 const std::string BackupContainerS3BlobStoreImpl::INDEXFOLDER = "backups";
 
 std::string BackupContainerS3BlobStore::dataPath(const std::string& path) {
+	// if a key prefix was given, the entire layout lives under it.
 	// if backup, include the backup data prefix.
 	// if m_name ends in a trailing slash, don't add another
 	std::string dataPath = "";
+	if (!m_prefix.empty()) {
+		dataPath = m_prefix + "/";
+	}
 	if (isBackup) {
-		dataPath = BackupContainerS3BlobStoreImpl::DATAFOLDER + "/";
+		dataPath += BackupContainerS3BlobStoreImpl::DATAFOLDER + "/";
 	}
 	if (!m_name.empty() && m_name.back() == '/') {
 		dataPath += m_name + path;
@@ -149,7 +160,11 @@ std::string BackupContainerS3BlobStore::dataPath(const std::string& path) {
 // Get the path of the backups's index entry
 std::string BackupContainerS3BlobStore::indexEntry() {
 	ASSERT(isBackup);
-	return BackupContainerS3BlobStoreImpl::INDEXFOLDER + "/" + m_name;
+	std::string path = BackupContainerS3BlobStoreImpl::INDEXFOLDER + "/" + m_name;
+	if (!m_prefix.empty()) {
+		path = m_prefix + "/" + path;
+	}
+	return path;
 }
 
 BackupContainerS3BlobStore::BackupContainerS3BlobStore(Reference<S3BlobStoreEndpoint> bstore,
@@ -159,10 +174,14 @@ BackupContainerS3BlobStore::BackupContainerS3BlobStore(Reference<S3BlobStoreEndp
                                                        bool isBackup)
   : m_bstore(bstore), m_name(name), m_bucket("FDB_BACKUPS_V2"), isBackup(isBackup) {
 	setEncryptionKey(encryptionKeyFileName);
-	// Currently only one parameter is supported, "bucket"
+	// Two parameters are supported, "bucket" and "prefix"
 	for (const auto& [name, value] : params) {
 		if (name == "bucket") {
 			m_bucket = value;
+			continue;
+		}
+		if (name == "prefix") {
+			m_prefix = normalizePrefix(value, &IBackupContainer::lastOpenError);
 			continue;
 		}
 		TraceEvent(SevWarn, "BackupContainerS3BlobStoreInvalidParameter").detail("Name", name).detail("Value", value);
@@ -179,7 +198,9 @@ void BackupContainerS3BlobStore::delref() {
 }
 
 std::string BackupContainerS3BlobStore::getURLFormat() {
-	return S3BlobStoreEndpoint::getURLFormat(true) + " (Note: The 'bucket' parameter is required.)";
+	return S3BlobStoreEndpoint::getURLFormat(true) +
+	       " (Note: The 'bucket' parameter is required.  The optional 'prefix' parameter places the backup's "
+	       "data and index folder trees under the given object key prefix instead of the bucket root.)";
 }
 
 Future<Reference<IAsyncFile>> BackupContainerS3BlobStore::readFile(const std::string& path) {
@@ -199,8 +220,9 @@ Future<Reference<IAsyncFile>> BackupContainerS3BlobStore::readFile(const std::st
 }
 
 Future<std::vector<std::string>> BackupContainerS3BlobStore::listURLs(Reference<S3BlobStoreEndpoint> bstore,
-                                                                      const std::string& bucket) {
-	return BackupContainerS3BlobStoreImpl::listURLs(bstore, bucket);
+                                                                      const std::string& bucket,
+                                                                      const std::string& prefix) {
+	return BackupContainerS3BlobStoreImpl::listURLs(bstore, bucket, prefix);
 }
 
 Future<Reference<IBackupFile>> BackupContainerS3BlobStore::writeFile(const std::string& path) {
@@ -241,4 +263,86 @@ Future<Void> BackupContainerS3BlobStore::deleteContainer(int* pNumDeleted) {
 
 std::string BackupContainerS3BlobStore::getBucket() const {
 	return m_bucket;
+}
+
+std::string BackupContainerS3BlobStore::getPrefix() const {
+	return m_prefix;
+}
+
+TEST_CASE("/backup/containers/blobstore/prefix") {
+	// Normalization: leading/trailing slashes are stripped, empty selects the default layout.
+	ASSERT(BackupContainerS3BlobStore::normalizePrefix("").empty());
+	ASSERT(BackupContainerS3BlobStore::normalizePrefix("/").empty());
+	ASSERT(BackupContainerS3BlobStore::normalizePrefix("///").empty());
+	ASSERT(BackupContainerS3BlobStore::normalizePrefix("a") == "a");
+	ASSERT(BackupContainerS3BlobStore::normalizePrefix("/a/b/") == "a/b");
+	ASSERT(BackupContainerS3BlobStore::normalizePrefix("tenant/data") == "tenant/data");
+	ASSERT(BackupContainerS3BlobStore::normalizePrefix("my_instance/backups") == "my_instance/backups");
+	ASSERT(BackupContainerS3BlobStore::normalizePrefix("v1/backups/backup-001.fdb") == "v1/backups/backup-001.fdb");
+
+	// Invalid values: reserved first segments, empty, "." or ".." segments and disallowed characters.
+	for (auto bad : { "data",
+	                  "/data/x/",
+	                  "backups",
+	                  "/backups/x/",
+	                  "a//b",
+	                  ".",
+	                  "..",
+	                  "a/../b",
+	                  "a/./b",
+	                  "a b",
+	                  "a?b",
+	                  "a%2Fb" }) {
+		try {
+			BackupContainerS3BlobStore::normalizePrefix(bad);
+			ASSERT(false);
+		} catch (Error& e) {
+			ASSERT_EQ(e.code(), error_code_backup_invalid_url);
+		}
+	}
+
+	// URL parameter parsing: "prefix" is accepted and normalized, unknown parameters still throw.
+	std::string resource;
+	std::string error;
+	S3BlobStoreEndpoint::ParametersT backupParams;
+	Reference<S3BlobStoreEndpoint> bstore = S3BlobStoreEndpoint::fromString(
+	    "blobstore://ak:sk@localhost:9999/some/container?bucket=bkt&region=us-east-1&prefix=old&prefix=/p1/p2/",
+	    {},
+	    &resource,
+	    &error,
+	    &backupParams);
+	ASSERT(bstore.isValid());
+	ASSERT(resource == "some/container");
+	auto c = makeReference<BackupContainerS3BlobStore>(bstore, resource, backupParams, Optional<std::string>(), true);
+	ASSERT(c->getBucket() == "bkt");
+	ASSERT(c->getPrefix() == "p1/p2");
+
+	// HTML entity encoded ampersands are not decoded: "amp;prefix" is an unknown parameter and is rejected.
+	std::string htmlResource;
+	S3BlobStoreEndpoint::ParametersT htmlParams;
+	Reference<S3BlobStoreEndpoint> htmlStore =
+	    S3BlobStoreEndpoint::fromString("blobstore://localhost:9999/some/container?bucket=bkt&region=us-east-1&amp;"
+	                                    "prefix=p",
+	                                    {},
+	                                    &htmlResource,
+	                                    &error,
+	                                    &htmlParams);
+	ASSERT(htmlStore.isValid());
+	try {
+		makeReference<BackupContainerS3BlobStore>(htmlStore, htmlResource, htmlParams, Optional<std::string>(), true);
+		ASSERT(false);
+	} catch (Error& e) {
+		ASSERT_EQ(e.code(), error_code_backup_invalid_url);
+	}
+
+	S3BlobStoreEndpoint::ParametersT badParams = backupParams;
+	badParams["prefix"] = "has space";
+	try {
+		makeReference<BackupContainerS3BlobStore>(bstore, resource, badParams, Optional<std::string>(), true);
+		ASSERT(false);
+	} catch (Error& e) {
+		ASSERT_EQ(e.code(), error_code_backup_invalid_url);
+	}
+
+	return Void();
 }
