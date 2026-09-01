@@ -4,8 +4,8 @@ project(azurestorage-download)
 
 include(ExternalProject)
 ExternalProject_Add(azurestorage
-  GIT_REPOSITORY    https://github.com/Azure/azure-storage-cpplite.git
-  GIT_TAG           11e1f98b021446ef340f4886796899a6eb1ad9a5 # v0.3.0
+  GIT_REPOSITORY    ${AZURE_STORAGE_CPPLITE_REPO}
+  GIT_TAG           ${AZURE_STORAGE_CPPLITE_TAG} # v0.3.0
   SOURCE_DIR        "${CMAKE_CURRENT_BINARY_DIR}/azurestorage-src"
   BINARY_DIR        "${CMAKE_CURRENT_BINARY_DIR}/azurestorage-build"
   CMAKE_ARGS        "-DCMAKE_BUILD_TYPE=Release"

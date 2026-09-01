@@ -175,6 +175,31 @@ Signing Protocol
 AWS signature version 4 is the default signing protocol choice. This boolean knob ``--knob_http_request_aws_v4_header`` can be used to select between v4 style and v2 style signatures.
 If the knob is set to ``true`` then v4 signature will be used and if set to ``false`` then v2 signature will be used.
 
+Backup URLs for Azure Blob Storage
+==================================
+
+For Azure Blob Storage backup locations (requires a client built with ``BUILD_AZURE_BACKUP``), the Backup URL format is
+
+::
+
+    azure://<account_name>.blob.core.windows.net/<container_name>[/<key_prefix>]
+
+      <account_name>    Name of the Azure storage account.
+      <container_name>  Name of the blob container inside the storage account.
+      <key_prefix>      Optional object key prefix.  When present, all of the backup's blobs are placed under this prefix inside the container, so one container can hold multiple backups.  Each path segment may contain only ASCII alphanumerics, '_', '-' and '.'; '/' separates segments.  Empty, '.' and '..' path segments are rejected.
+
+Without ``<key_prefix>`` the container itself represents a single backup and deleting the backup deletes the whole container.  With a ``<key_prefix>``, deleting the backup deletes only the blobs under that prefix and never the (shared) container.  Prefixes of different backups sharing one container must not be a path-prefix of one another.  Note that a container shared through key prefixes always exists as far as each backup is concerned, even before any backup data has been written under a given prefix.
+
+Authentication is selected with the ``FDB_AZURE_AUTH_MODE`` environment variable on every process that accesses the backup (the ``fdbbackup``/``fdbrestore`` tools and all ``backup_agent`` processes):
+
+ *shared_key* (or unset) - Storage account Shared Key authentication.  The account key is taken from the ``AZURE_KEY`` environment variable.  This is the original behavior.
+
+ *managed_identity* - Requests OAuth tokens for ``https://storage.azure.com/`` from the Azure Instance Metadata Service of the VM the process runs on.  The optional ``FDB_AZURE_CLIENT_ID`` environment variable selects a user-assigned managed identity; without it the system-assigned identity is used.  The identity needs the ``Storage Blob Data Contributor`` role on the target container or account.
+
+ *workload_identity* - Requests OAuth tokens using the federated service account token projected by Azure Workload Identity (e.g. on AKS), via the standard ``AZURE_CLIENT_ID``, ``AZURE_TENANT_ID``, ``AZURE_FEDERATED_TOKEN_FILE`` and ``AZURE_AUTHORITY_HOST`` environment variables.
+
+Tokens are refreshed automatically before they expire for as long as the process keeps the backup container open.
+
 .. _blob-credential-files:
 
 Blob Credential Files

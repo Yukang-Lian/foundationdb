@@ -304,8 +304,10 @@ Reference<IBackupContainer> IBackupContainer::openContainer(const std::string& u
 				auto endPoint = address.toString();
 				auto accountName = address.eat("."_sr).toString();
 				auto containerName = u.eat("/"_sr).toString();
+				// Any remaining path is an optional object key prefix inside the container.
+				auto keyPrefix = u.toString();
 				r = makeReference<BackupContainerAzureBlobStore>(
-				    endPoint, accountName, containerName, encryptionKeyFileName);
+				    endPoint, accountName, containerName, keyPrefix, encryptionKeyFileName);
 			} else {
 				// resolve the network address if necessary
 				std::string endpoint(address.toString());
@@ -334,8 +336,10 @@ Reference<IBackupContainer> IBackupContainer::openContainer(const std::string& u
 				endpoint =
 				    fmt::format("{}/{}", formatIpPort(parsedAddress.get().ip, parsedAddress.get().port), accountName);
 				auto containerName = u.eat("/"_sr).toString();
+				// Any remaining path is an optional object key prefix inside the container.
+				auto keyPrefix = u.toString();
 				r = makeReference<BackupContainerAzureBlobStore>(
-				    endpoint, accountName, containerName, encryptionKeyFileName);
+				    endpoint, accountName, containerName, keyPrefix, encryptionKeyFileName);
 			}
 		}
 #endif

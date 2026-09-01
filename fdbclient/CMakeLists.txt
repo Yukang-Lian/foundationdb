@@ -32,7 +32,15 @@ if(BUILD_AZURE_BACKUP)
   add_compile_definitions(BUILD_AZURE_BACKUP)
   set(FDBCLIENT_SRCS
     ${FDBCLIENT_SRCS}
+    azure_backup/AzureTokenProvider.cpp
     azure_backup/BackupContainerAzureBlobStore.actor.cpp)
+
+  # The azure-storage-cpplite source location can be overridden (e.g. with an internal
+  # mirror) for builds without access to github.com.
+  set(AZURE_STORAGE_CPPLITE_REPO "https://github.com/Azure/azure-storage-cpplite.git" CACHE STRING
+    "Git repository to fetch azure-storage-cpplite from")
+  set(AZURE_STORAGE_CPPLITE_TAG "11e1f98b021446ef340f4886796899a6eb1ad9a5" CACHE STRING
+    "Git tag/commit of azure-storage-cpplite to build")
 
   configure_file(azurestorage.cmake azurestorage-download/CMakeLists.txt)
 

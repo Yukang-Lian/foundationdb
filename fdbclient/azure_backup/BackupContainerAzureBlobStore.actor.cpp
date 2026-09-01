@@ -223,7 +223,7 @@ public:
 			throw file_not_found();
 		}
 		Reference<IAsyncFile> f =
-		    makeReference<ReadFile>(self->asyncTaskThread, self->containerName, fileName, self->client);
+		    makeReference<ReadFile>(self->asyncTaskThread, self->containerName, self->blobPath(fileName), self->client);
 		if (self->usesEncryption()) {
 			f = encryptFile(f, AsyncFileEncrypted::Mode::READ_ONLY);
 		}
@@ -235,12 +235,12 @@ public:
 		    .detail("ContainerName", self->containerName)
 		    .detail("FileName", fileName);
 		wait(self->asyncTaskThread.execAsync(
-		    [client = self->client, containerName = self->containerName, fileName = fileName] {
-			    waitAzureFuture(client->create_append_blob(containerName, fileName), "create_append_blob");
+		    [client = self->client, containerName = self->containerName, blobName = self->blobPath(fileName)] {
+			    waitAzureFuture(client->create_append_blob(containerName, blobName), "create_append_blob");
 			    return Void();
 		    }));
-		Reference<IAsyncFile> f =
-		    makeReference<WriteFile>(self->asyncTaskThread, self->containerName, fileName, self->client);
+		Reference<IAsyncFile> f = makeReference<WriteFile>(
+		    self->asyncTaskThread, self->containerName, self->blobPath(fileName), self->client);
 		if (self->usesEncryption()) {
 			f = encryptFile(f, AsyncFileEncrypted::Mode::APPEND_ONLY);
 		}
@@ -263,10 +263,29 @@ public:
 	}
 
 	ACTOR static Future<Void> deleteContainer(BackupContainerAzureBlobStore* self, int* pNumDeleted) {
+		if (!self->prefix.empty()) {
+			// Shared-container layout: this backup owns only the blobs under its key prefix.
+			// Delete those individually and never the container itself, which may hold other
+			// backups under different prefixes.
+			state BackupContainerFileSystem::FilesAndSizesT files = wait(self->listFiles());
+			TraceEvent(SevDebug, "BCAzureBlobStoreDeletePrefix")
+			    .detail("ContainerName", self->containerName)
+			    .detail("Prefix", self->prefix)
+			    .detail("FilesToDelete", files.size())
+			    .detail("TrackNumDeleted", pNumDeleted != nullptr);
+			state int i = 0;
+			for (; i < files.size(); ++i) {
+				wait(self->deleteFile(files[i].first));
+			}
+			if (pNumDeleted) {
+				*pNumDeleted += files.size();
+			}
+			return Void();
+		}
 		state int filesToDelete = 0;
 		if (pNumDeleted) {
-			BackupContainerFileSystem::FilesAndSizesT files = wait(self->listFiles());
-			filesToDelete = files.size();
+			BackupContainerFileSystem::FilesAndSizesT numFiles = wait(self->listFiles());
+			filesToDelete = numFiles.size();
 		}
 		TraceEvent(SevDebug, "BCAzureBlobStoreDeleteContainer")
 		    .detail("FilesToDelete", filesToDelete)
@@ -281,45 +300,142 @@ public:
 		}
 		return Void();
 	}
+
+	// Fetches an OAuth bearer token for Azure Storage and installs it into the container's
+	// token_credential, then keeps refreshing it before it expires for the lifetime of the
+	// container.  The blocking network calls run on the container's AsyncTaskThread.  The
+	// lambda deliberately captures the credential shared_ptr and the mode by value rather
+	// than self, so a task still queued while the container is being destroyed is safe.
+	ACTOR static Future<Void> tokenRefreshLoop(BackupContainerAzureBlobStore* self) {
+		state int consecutiveFailures = 0;
+		loop {
+			try {
+				double expiresIn =
+				    wait(self->asyncTaskThread.execAsync([mode = self->authMode, credential = self->tokenCredential] {
+					    AzureAccessToken token = fetchAzureStorageToken(mode);
+					    credential->set_token(token.token);
+					    return token.expiresIn;
+				    }));
+				consecutiveFailures = 0;
+				// Refresh five minutes before expiry, but not more than once a minute.
+				state double refreshDelay = std::max(60.0, expiresIn - 300.0);
+				TraceEvent("BCAzureBlobStoreTokenRefreshed")
+				    .suppressFor(60)
+				    .detail("ExpiresIn", expiresIn)
+				    .detail("NextRefreshIn", refreshDelay);
+				wait(delay(refreshDelay));
+			} catch (Error& e) {
+				if (e.code() == error_code_actor_cancelled) {
+					throw;
+				}
+				++consecutiveFailures;
+				TraceEvent(SevWarnAlways, "BCAzureBlobStoreTokenRefreshFailed")
+				    .error(e)
+				    .detail("ConsecutiveFailures", consecutiveFailures);
+				wait(delay(std::min(10.0 * consecutiveFailures, 120.0)));
+			}
+		}
+	}
 };
 
 Future<bool> BackupContainerAzureBlobStore::blobExists(const std::string& fileName) {
 	TraceEvent(SevDebug, "BCAzureBlobStoreCheckExists")
 	    .detail("FileName", fileName)
 	    .detail("ContainerName", containerName);
-	return asyncTaskThread.execAsync([client = this->client, containerName = this->containerName, fileName = fileName] {
-		auto outcome = client->get_blob_properties(containerName, fileName).get();
-		if (outcome.success()) {
-			return true;
-		} else {
-			auto const& err = outcome.error();
-			if (err.code == notFoundErrorCode) {
-				return false;
-			} else {
-				printAzureError("get_blob_properties", err);
-				throw backup_error();
+	return asyncTaskThread.execAsync(
+	    [client = this->client, containerName = this->containerName, blobName = blobPath(fileName)] {
+		    auto outcome = client->get_blob_properties(containerName, blobName).get();
+		    if (outcome.success()) {
+			    return true;
+		    } else {
+			    auto const& err = outcome.error();
+			    if (err.code == notFoundErrorCode) {
+				    return false;
+			    } else {
+				    printAzureError("get_blob_properties", err);
+				    throw backup_error();
+			    }
+		    }
+	    });
+}
+
+std::string BackupContainerAzureBlobStore::normalizePrefix(std::string prefix) {
+	size_t begin = prefix.find_first_not_of('/');
+	if (begin == std::string::npos) {
+		return "";
+	}
+	size_t end = prefix.find_last_not_of('/');
+	prefix = prefix.substr(begin, end - begin + 1);
+
+	auto invalidPrefix = [&]() {
+		IBackupContainer::lastOpenError = "Invalid azure key prefix: '" + prefix + "'";
+		throw backup_invalid_url();
+	};
+	auto validSegment = [](const std::string& segment) {
+		return !segment.empty() && segment != "." && segment != "..";
+	};
+	auto isAsciiAlphanumeric = [](char c) {
+		return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+	};
+
+	// Reject empty ("//"), "." and ".." segments and unexpected characters so the prefix
+	// always denotes a well-formed blob path that cannot traverse upward.
+	std::string segment;
+	for (auto c : prefix) {
+		if (c == '/') {
+			if (!validSegment(segment)) {
+				invalidPrefix();
 			}
+			segment.clear();
+			continue;
 		}
-	});
+		if (!isAsciiAlphanumeric(c) && c != '_' && c != '-' && c != '.') {
+			invalidPrefix();
+		}
+		segment += c;
+	}
+	if (!validSegment(segment)) {
+		invalidPrefix();
+	}
+	return prefix;
 }
 
 BackupContainerAzureBlobStore::BackupContainerAzureBlobStore(const std::string& endpoint,
                                                              const std::string& accountName,
                                                              const std::string& containerName,
+                                                             const std::string& rawPrefix,
                                                              const Optional<std::string>& encryptionKeyFileName)
-  : containerName(containerName) {
+  : containerName(containerName), prefix(normalizePrefix(rawPrefix)) {
 	setEncryptionKey(encryptionKeyFileName);
-	const char* _accountKey = std::getenv("AZURE_KEY");
-	if (!_accountKey) {
-		TraceEvent(SevError, "EnvironmentVariableNotFound").detail("EnvVariable", "AZURE_KEY");
-		// TODO: More descriptive error?
-		throw backup_error();
+	authMode = azureAuthModeFromEnvironment();
+	std::shared_ptr<azure::storage_lite::storage_credential> credential;
+	if (authMode == AzureAuthMode::SHARED_KEY) {
+		const char* _accountKey = std::getenv("AZURE_KEY");
+		if (!_accountKey) {
+			TraceEvent(SevError, "EnvironmentVariableNotFound").detail("EnvVariable", "AZURE_KEY");
+			// TODO: More descriptive error?
+			throw backup_error();
+		}
+		std::string accountKey = _accountKey;
+		credential = std::make_shared<azure::storage_lite::shared_key_credential>(accountName, accountKey);
+	} else {
+		// OAuth bearer token authentication (managed identity or workload identity).  The
+		// credential starts out with an empty token; the initial fetch is queued as the first
+		// task on this container's AsyncTaskThread, so every subsequent operation on the
+		// container naturally runs after a token has been installed.
+		tokenCredential = std::make_shared<azure::storage_lite::token_credential>("");
+		credential = tokenCredential;
 	}
-	std::string accountKey = _accountKey;
-	auto credential = std::make_shared<azure::storage_lite::shared_key_credential>(accountName, accountKey);
+	// FDB_AZURE_ALLOW_HTTP=1 selects plain http, for local testing (e.g. Azurite) and private
+	// endpoints only.  Defaults to https.
+	const char* allowHttp = std::getenv("FDB_AZURE_ALLOW_HTTP");
+	bool useHttps = !(allowHttp != nullptr && std::string(allowHttp) == "1");
 	auto storageAccount = std::make_shared<azure::storage_lite::storage_account>(
-	    accountName, credential, true, fmt::format("https://{}", endpoint));
+	    accountName, credential, useHttps, (useHttps ? "https://" : "http://") + endpoint);
 	client = std::make_unique<AzureClient>(storageAccount, 1);
+	if (tokenCredential != nullptr) {
+		tokenRefreshFuture = BackupContainerAzureBlobStoreImpl::tokenRefreshLoop(this);
+	}
 }
 
 void BackupContainerAzureBlobStore::addref() {
@@ -370,7 +486,7 @@ Future<Reference<IBackupFile>> BackupContainerAzureBlobStore::writeFile(const st
 }
 
 Future<Void> BackupContainerAzureBlobStore::writeEntireFile(const std::string& fileName,
-                                                            const std::string& fileConents) {
+                                                            const std::string& fileContents) {
 	return writeEntireFileFallback(fileName, fileContents);
 }
 
@@ -378,22 +494,39 @@ Future<BackupContainerFileSystem::FilesAndSizesT> BackupContainerAzureBlobStore:
     const std::string& path,
     std::function<bool(std::string const&)> folderPathFilter) {
 	TraceEvent(SevDebug, "BCAzureBlobStoreListFiles").detail("ContainerName", containerName).detail("Path", path);
-	return asyncTaskThread.execAsync(
-	    [client = this->client, containerName = this->containerName, path = path, folderPathFilter = folderPathFilter] {
-		    FilesAndSizesT result;
-		    BackupContainerAzureBlobStoreImpl::listFiles(client, containerName, path, folderPathFilter, result);
-		    return result;
-	    });
+	return asyncTaskThread.execAsync([client = this->client,
+	                                  containerName = this->containerName,
+	                                  queryPath = blobPath(path),
+	                                  stripLen = prefix.empty() ? size_t(0) : prefix.size() + 1,
+	                                  folderPathFilter = folderPathFilter] {
+		// The impl works on raw blob names; translate the filter's input and the results
+		// back to container-relative names when a key prefix is in use.
+		std::function<bool(std::string const&)> rawNameFilter = folderPathFilter;
+		if (stripLen > 0 && folderPathFilter) {
+			rawNameFilter = [folderPathFilter, stripLen](const std::string& folderPath) {
+				return folderPathFilter(folderPath.substr(stripLen));
+			};
+		}
+		FilesAndSizesT result;
+		BackupContainerAzureBlobStoreImpl::listFiles(client, containerName, queryPath, rawNameFilter, result);
+		if (stripLen > 0) {
+			for (auto& file : result) {
+				file.first = file.first.substr(stripLen);
+			}
+		}
+		return result;
+	});
 }
 
 Future<Void> BackupContainerAzureBlobStore::deleteFile(const std::string& fileName) {
 	TraceEvent(SevDebug, "BCAzureBlobStoreDeleteFile")
 	    .detail("ContainerName", containerName)
 	    .detail("FileName", fileName);
-	return asyncTaskThread.execAsync([containerName = this->containerName, fileName = fileName, client = client]() {
-		client->delete_blob(containerName, fileName).wait();
-		return Void();
-	});
+	return asyncTaskThread.execAsync(
+	    [containerName = this->containerName, blobName = blobPath(fileName), client = client]() {
+		    client->delete_blob(containerName, blobName).wait();
+		    return Void();
+	    });
 }
 
 Future<Void> BackupContainerAzureBlobStore::deleteContainer(int* pNumDeleted) {
@@ -406,5 +539,40 @@ Future<std::vector<std::string>> BackupContainerAzureBlobStore::listURLs(const s
 }
 
 std::string BackupContainerAzureBlobStore::getURLFormat() {
-	return "azure://<accountname>@<endpoint>/<container>/";
+	return "azure://<accountname>@<endpoint>/<container>[/<key_prefix>]/ (Note: The optional <key_prefix> places all "
+	       "of the backup's blobs under the given key prefix inside the container, so one container can hold multiple "
+	       "backups.)";
+}
+
+namespace {
+
+// The body of the Azure prefix unit test.  A plain function so the actor compiler does not
+// transform it (the test is fully synchronous).
+void testAzureBackupPrefix() {
+	// Normalization: leading/trailing slashes are stripped, empty selects the original layout.
+	ASSERT(BackupContainerAzureBlobStore::normalizePrefix("").empty());
+	ASSERT(BackupContainerAzureBlobStore::normalizePrefix("/").empty());
+	ASSERT(BackupContainerAzureBlobStore::normalizePrefix("///").empty());
+	ASSERT(BackupContainerAzureBlobStore::normalizePrefix("a") == "a");
+	ASSERT(BackupContainerAzureBlobStore::normalizePrefix("/a/b/") == "a/b");
+	// Unlike the S3 blobstore container, Azure has no reserved top-level folder names.
+	ASSERT(BackupContainerAzureBlobStore::normalizePrefix("data") == "data");
+	ASSERT(BackupContainerAzureBlobStore::normalizePrefix("backups/x") == "backups/x");
+
+	// Invalid values: empty, "." or ".." segments and disallowed characters.
+	for (auto bad : { "a//b", ".", "..", "a/../b", "a/./b", "a b", "a?b", "a%2Fb" }) {
+		try {
+			BackupContainerAzureBlobStore::normalizePrefix(bad);
+			ASSERT(false);
+		} catch (Error& e) {
+			ASSERT_EQ(e.code(), error_code_backup_invalid_url);
+		}
+	}
+}
+
+} // namespace
+
+TEST_CASE("/backup/containers/azure/prefix") {
+	testAzureBackupPrefix();
+	return Void();
 }

@@ -269,7 +269,11 @@ std::string BackupContainerS3BlobStore::getPrefix() const {
 	return m_prefix;
 }
 
-TEST_CASE("/backup/containers/blobstore/prefix") {
+namespace {
+
+// The body of the prefix unit test.  A plain function so the actor compiler does not
+// transform it (the test is fully synchronous).
+void testBlobstoreBackupPrefix() {
 	// Normalization: leading/trailing slashes are stripped, empty selects the default layout.
 	ASSERT(BackupContainerS3BlobStore::normalizePrefix("").empty());
 	ASSERT(BackupContainerS3BlobStore::normalizePrefix("/").empty());
@@ -343,6 +347,11 @@ TEST_CASE("/backup/containers/blobstore/prefix") {
 	} catch (Error& e) {
 		ASSERT_EQ(e.code(), error_code_backup_invalid_url);
 	}
+}
 
+} // namespace
+
+TEST_CASE("/backup/containers/blobstore/prefix") {
+	testBlobstoreBackupPrefix();
 	return Void();
 }

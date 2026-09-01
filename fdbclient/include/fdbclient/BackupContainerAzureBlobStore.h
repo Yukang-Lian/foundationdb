@@ -23,6 +23,7 @@
 #pragma once
 
 #include "fdbclient/AsyncTaskThread.h"
+#include "fdbclient/AzureTokenProvider.h"
 #include "fdbclient/BackupContainerFileSystem.h"
 
 #include "blob/blob_client.h"
@@ -33,17 +34,49 @@ class BackupContainerAzureBlobStore final : public BackupContainerFileSystem,
 
 	std::shared_ptr<AzureClient> client;
 	std::string containerName;
+
+	// Optional object key prefix under which all of this backup's blobs are placed inside the
+	// container.  Normalized to contain no leading or trailing slash.  Empty selects the
+	// original one-backup-per-container layout.
+	std::string prefix;
+
 	AsyncTaskThread asyncTaskThread;
+
+	// Maps a container-relative file name to the actual blob name, applying the optional key
+	// prefix.  With a non-empty prefix and an empty fileName this yields "<prefix>/", the
+	// listing query prefix for the entire backup.
+	std::string blobPath(const std::string& fileName) const {
+		return prefix.empty() ? fileName : prefix + "/" + fileName;
+	}
+
+	// How this container authenticates against Azure Storage.  See AzureTokenProvider.h.
+	AzureAuthMode authMode{ AzureAuthMode::SHARED_KEY };
+
+	// Non-null when authMode uses OAuth bearer tokens.  The token value is refreshed by
+	// tokenRefreshFuture's actor via set_token().
+	std::shared_ptr<azure::storage_lite::token_credential> tokenCredential;
 
 	Future<bool> blobExists(const std::string& fileName);
 
 	friend class BackupContainerAzureBlobStoreImpl;
 
+	// Keeps the bearer token fresh for the lifetime of this container.  Must be the last
+	// member so its destruction (which cancels the refresh actor) happens before the members
+	// the actor uses are destroyed.
+	Future<Void> tokenRefreshFuture;
+
 public:
 	BackupContainerAzureBlobStore(const std::string& endpoint,
 	                              const std::string& accountName,
 	                              const std::string& containerName,
+	                              const std::string& rawPrefix,
 	                              const Optional<std::string>& encryptionKeyFileName);
+
+	// Normalize and validate an object key prefix taken from the path portion of an azure://
+	// URL.  Strips leading and trailing slashes; an empty result selects the original
+	// one-backup-per-container layout.  Throws backup_invalid_url if a path segment contains
+	// characters outside [A-Za-z0-9._-] or a segment is empty, "." or "..".
+	static std::string normalizePrefix(std::string prefix);
 
 	void addref() override;
 	void delref() override;
