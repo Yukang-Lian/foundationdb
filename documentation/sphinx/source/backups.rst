@@ -107,6 +107,10 @@ If <secret> is not specified, it will be looked up in :ref:`blob credential sour
 
 An example blob store Backup URL would be ``blobstore://myKey:mySecret@something.domain.com:80/dec_1_2017_0400?bucket=backups``.
 
+Blob store connections use TLS unless ``sc=0`` is given.  The server certificate is verified against the CA configured with ``--tls_ca_file`` (or ``FDB_TLS_CA_FILE``); when none is configured, the operating system's CA store is used, so public endpoints work without extra configuration.  The host name from the URL is sent as SNI.  Host names that resolve to both IPv4 and IPv6 addresses are connected over IPv4 first (knob ``resolve_prefer_ipv4_addr``).  When an HTTP proxy is used, the URL must contain an explicit port.
+
+Google Cloud Storage is supported through its S3-compatible XML API at ``storage.googleapis.com``.  With HMAC keys the URL is ``blobstore://<hmac_access_id>:<hmac_secret>@storage.googleapis.com/<name>?bucket=<bucket>&region=<bucket_location>`` (Cloud Storage accepts any ``region`` value; the bucket's location is recommended).  On a GCE VM or a GKE pod with a service account, ``blobstore://storage.googleapis.com/<name>?bucket=<bucket>&gcp_auth=1`` authenticates with the service account's access tokens and needs no keys at all.  In both cases the bucket must already exist and the identity needs ``storage.buckets.get`` on it in addition to object read/write/delete/list permissions (for example the ``roles/storage.objectAdmin`` and ``roles/storage.legacyBucketReader`` roles on the bucket).
+
 Blob store Backup URLs can have optional parameters at the end which set various limits or options used when communicating with the store.  All values must be positive decimal integers unless otherwise specified.  The speed related default values are not very restrictive.  The most likely parameter a user would want to change is ``max_send_bytes_per_second`` (or ``sbps`` for short) which determines the upload speed to the blob service.
 
 Here is a complete list of valid parameters:
@@ -166,6 +170,8 @@ Here is a complete list of valid parameters:
  *header* - Add an additional HTTP header to each blob store REST API request.  Can be specified multiple times.  Format is *header=<FieldName>:<FieldValue>* where both strings are non-empty.
 
  *sdk_auth* (or *sa*) - Use the AWS SDK to do credentials and authentication. This supports all aws authentication types, including credential-less iam role-based authentication in aws. Experimental, and only works if FDB was compiled with BUILD_AWS_BACKUP=ON. When this parameter is set, all other credential parts of the backup url can be ignored.
+
+ *gcp_auth* (or *ga*) - Set to 1 to authenticate to Google Cloud Storage with OAuth2 access tokens obtained from the GCE/GKE metadata server (the service account attached to the VM, or GKE Workload Identity) instead of HMAC keys.  The URL must not contain credentials and needs no ``region``.  Tokens are refreshed automatically before they expire.  The environment variable ``FDB_GCE_METADATA_ENDPOINT`` (``host[:port]``) overrides the metadata server address, which is only useful for testing.
  
   **Example**: The URL parameter *header=x-amz-storage-class:REDUCED_REDUNDANCY* would send the HTTP header required to use the reduced redundancy storage option in the S3 API.
 

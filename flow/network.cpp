@@ -373,7 +373,14 @@ Future<Reference<IConnection>> INetworkConnections::connect(const std::string& h
 	// Wait for the endpoint to return, then wait for connect(endpoint) and return it.
 	// Template types are being provided explicitly because they can't be automatically deduced for some reason.
 	return mapAsync(pickEndpoint, [=](NetworkAddress const& addr) -> Future<Reference<IConnection>> {
-		return connectExternal(addr);
+		return map(connectExternal(addr), [=](Reference<IConnection> const& conn) {
+			// Servers with several certificates, or which refuse SNI-less clients (Google Cloud Storage does), need
+			// the host name in the handshake. IP literals are never valid SNI values.
+			if (isTLS && !IPAddress::parse(host).present()) {
+				conn->setServerName(host);
+			}
+			return conn;
+		});
 	});
 }
 

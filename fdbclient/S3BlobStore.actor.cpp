@@ -34,6 +34,8 @@
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string.hpp>
 #include "flow/IAsyncFile.h"
+#include "flow/IRateControl.h"
+#include "flow/Platform.h"
 #include "flow/Hostname.h"
 #include "flow/UnitTest.h"
 #include "rapidxml/rapidxml.hpp"
@@ -98,6 +100,7 @@ S3BlobStoreEndpoint::BlobKnobs::BlobKnobs() {
 	max_delay_retryable_error = CLIENT_KNOBS->BLOBSTORE_MAX_DELAY_RETRYABLE_ERROR;
 	max_delay_connection_failed = CLIENT_KNOBS->BLOBSTORE_MAX_DELAY_CONNECTION_FAILED;
 	sdk_auth = false;
+	gcp_auth = false;
 	global_connection_pool = CLIENT_KNOBS->BLOBSTORE_GLOBAL_CONNECTION_POOL;
 }
 
@@ -139,6 +142,7 @@ bool S3BlobStoreEndpoint::BlobKnobs::set(StringRef name, int value) {
 	TRY_PARAM(max_delay_retryable_error, dre);
 	TRY_PARAM(max_delay_connection_failed, dcf);
 	TRY_PARAM(sdk_auth, sa);
+	TRY_PARAM(gcp_auth, ga);
 	TRY_PARAM(global_connection_pool, gcp);
 #undef TRY_PARAM
 	return false;
@@ -178,6 +182,7 @@ std::string S3BlobStoreEndpoint::BlobKnobs::getURLParameters() const {
 	_CHECK_PARAM(max_send_bytes_per_second, sbps);
 	_CHECK_PARAM(max_recv_bytes_per_second, rbps);
 	_CHECK_PARAM(sdk_auth, sa);
+	_CHECK_PARAM(gcp_auth, ga);
 	_CHECK_PARAM(global_connection_pool, gcp);
 	_CHECK_PARAM(max_delay_retryable_error, dre);
 	_CHECK_PARAM(max_delay_connection_failed, dcf);
@@ -340,7 +345,13 @@ Reference<S3BlobStoreEndpoint> S3BlobStoreEndpoint::fromString(const std::string
 			creds = S3BlobStoreEndpoint::Credentials{ key.toString(), secret.toString(), securityToken.toString() };
 		}
 
-		if (region.empty() && CLIENT_KNOBS->HTTP_REQUEST_AWS_V4_HEADER) {
+		if (knobs.gcp_auth && creds.present()) {
+			throw std::string("gcp_auth=1 authenticates with tokens from the GCE/GKE metadata server, remove the "
+			                  "credentials from the URL");
+		}
+
+		// Bearer token auth does not sign requests, so it needs no region.
+		if (region.empty() && CLIENT_KNOBS->HTTP_REQUEST_AWS_V4_HEADER && !knobs.gcp_auth) {
 			throw std::string(
 			    "Failed to get region from host or parameter in url, region is required for aws v4 signature");
 		}
@@ -658,7 +669,154 @@ static S3BlobStoreEndpoint::Credentials getSecretSdk() {
 #endif
 }
 
+// Fetches an OAuth2 access token for the VM's or pod's service account from the GCE/GKE metadata server. The
+// server is reached directly (never through the blobstore proxy); FDB_GCE_METADATA_ENDPOINT=host[:port] overrides
+// its address for testing.
+ACTOR Future<Void> refreshBearerToken_impl(Reference<S3BlobStoreEndpoint> b) {
+	// NonCopyable state, so the actor compiler must construct it up front (leading declaration) rather than assign it
+	state UnsentPacketQueue content;
+	state std::string endpointHost = "169.254.169.254";
+	state std::string endpointService = "80";
+	std::string endpointOverride;
+	if (platform::getEnvironmentVar("FDB_GCE_METADATA_ENDPOINT", endpointOverride) && !endpointOverride.empty()) {
+		StringRef e(endpointOverride);
+		if (e.startsWith("http://"_sr)) {
+			e = e.substr(7);
+		}
+		endpointHost = e.eat(":").toString();
+		if (e.size() > 0) {
+			endpointService = e.toString();
+		}
+	}
+
+	state int attempt = 0;
+	loop {
+		try {
+			state Reference<IConnection> conn = wait(
+			    timeoutError(INetworkConnections::net()->connect(endpointHost, endpointService, false), 10.0));
+			wait(conn->connectHandshake());
+
+			state Reference<HTTP::OutgoingRequest> req = makeReference<HTTP::OutgoingRequest>();
+			req->verb = "GET";
+			req->resource = "/computeMetadata/v1/instance/service-accounts/default/token";
+			req->data.content = &content;
+			req->data.contentLen = 0;
+			req->data.headers["Host"] = endpointHost;
+			req->data.headers["Metadata-Flavor"] = "Google";
+
+			state Reference<IRateControl> rate = makeReference<Unlimited>();
+			state int64_t bytesSent = 0;
+			Reference<HTTP::IncomingResponse> r =
+			    wait(timeoutError(HTTP::doRequest(conn, req, rate, &bytesSent, rate), 10.0));
+			conn->close();
+
+			if (r->code != 200) {
+				TraceEvent(SevWarn, "S3BlobStoreGcpTokenBadResponse")
+				    .detail("Code", r->code)
+				    .detail("Endpoint", endpointHost + ":" + endpointService);
+				throw http_bad_response();
+			}
+			std::string token;
+			double expiresIn = 0;
+			std::string parseError;
+			if (!S3BlobStoreEndpoint::parseGcpTokenResponse(r->data.content, token, expiresIn, &parseError)) {
+				TraceEvent(SevWarn, "S3BlobStoreGcpTokenParseFailed").detail("Reason", parseError);
+				throw http_bad_response();
+			}
+
+			b->bearerToken = token;
+			b->bearerTokenExpiration = now() + expiresIn;
+			TraceEvent("S3BlobStoreGcpTokenRefreshed")
+			    .detail("ExpiresIn", expiresIn)
+			    .detail("Endpoint", endpointHost + ":" + endpointService);
+			return Void();
+		} catch (Error& e) {
+			if (e.code() == error_code_actor_cancelled) {
+				throw;
+			}
+			++attempt;
+			TraceEvent(SevWarn, "S3BlobStoreGcpTokenRefreshFailed").errorUnsuppressed(e).detail("Attempt", attempt);
+			if (attempt >= 3) {
+				fprintf(stderr,
+				        "ERROR: Unable to get an access token from the GCE/GKE metadata server at %s:%s (%s). "
+				        "gcp_auth=1 requires running on a GCE VM or GKE pod with a service account.\n",
+				        endpointHost.c_str(),
+				        endpointService.c_str(),
+				        e.what());
+				throw backup_auth_missing();
+			}
+			wait(delay(attempt));
+		}
+	}
+}
+
+Future<Void> S3BlobStoreEndpoint::ensureBearerToken() {
+	// Refresh once less than 5 minutes remain, which is also when the metadata server starts handing out a new token.
+	if (!bearerToken.empty() && bearerTokenExpiration - now() > 300) {
+		return Void();
+	}
+	// Share one in-flight refresh between concurrent requests. A finished refresh, successful or not, is replaced.
+	if (!bearerTokenRefresh.isValid() || bearerTokenRefresh.isReady()) {
+		bearerTokenRefresh = refreshBearerToken_impl(Reference<S3BlobStoreEndpoint>::addRef(this));
+	}
+	return bearerTokenRefresh;
+}
+
+void S3BlobStoreEndpoint::setBearerAuthHeaders(HTTP::Headers& headers) {
+	// The GCS XML API requires a Date header on every request.
+	char dateBuf[64];
+	time_t ts;
+	time(&ts);
+	strftime(dateBuf, 64, "%a, %d %b %Y %H:%M:%S GMT", gmtime(&ts));
+	headers["Date"] = dateBuf;
+	headers["Authorization"] = "Bearer " + bearerToken;
+}
+
+bool S3BlobStoreEndpoint::parseGcpTokenResponse(std::string const& body,
+                                                std::string& token,
+                                                double& expiresIn,
+                                                std::string* error) {
+	json_spirit::mValue json;
+	if (!json_spirit::read_string(body, json) || json.type() != json_spirit::obj_type) {
+		if (error)
+			*error = "token response is not a JSON object";
+		return false;
+	}
+	JSONDoc doc(json.get_obj());
+	if (!doc.tryGet("access_token", token) || token.empty()) {
+		if (error)
+			*error = "token response has no access_token";
+		return false;
+	}
+	// The metadata server returns expires_in as a number; some token endpoints return it as a string.
+	if (!doc.tryGet("expires_in", expiresIn)) {
+		std::string s;
+		char* end = nullptr;
+		if (!doc.tryGet("expires_in", s)) {
+			if (error)
+				*error = "token response has no expires_in";
+			return false;
+		}
+		expiresIn = strtod(s.c_str(), &end);
+		if (end == s.c_str() || *end != 0) {
+			if (error)
+				*error = "token response has a non-numeric expires_in";
+			return false;
+		}
+	}
+	if (expiresIn <= 0) {
+		if (error)
+			*error = "token response has a non-positive expires_in";
+		return false;
+	}
+	return true;
+}
+
 ACTOR Future<Void> updateSecret_impl(Reference<S3BlobStoreEndpoint> b) {
+	if (b->knobs.gcp_auth) {
+		wait(b->ensureBearerToken());
+		return Void();
+	}
 	if (b->knobs.sdk_auth) {
 		b->credentials = getSecretSdk();
 		return Void();
@@ -790,7 +948,7 @@ ACTOR Future<S3BlobStoreEndpoint::ReusableConnection> connect_impl(Reference<S3B
 	    .detail("ExpiresIn", b->knobs.max_connection_life)
 	    .detail("Proxy", b->proxyHost.orDefault(""));
 
-	if (b->lookupKey || b->lookupSecret || b->knobs.sdk_auth)
+	if (b->lookupKey || b->lookupSecret || b->knobs.sdk_auth || b->knobs.gcp_auth)
 		wait(b->updateSecret());
 
 	return S3BlobStoreEndpoint::ReusableConnection({ conn, now() + b->knobs.max_connection_life });
@@ -929,17 +1087,26 @@ ACTOR Future<Reference<HTTP::IncomingResponse>> doRequest_impl(Reference<S3BlobS
 			    wait(timeoutError(frconn, bstore->knobs.connect_timeout));
 			connectionEstablished = true;
 			connID = rconn.conn->getDebugID();
+
+			// A pooled connection can outlive the bearer token, so check the token before every request.
+			if (bstore->knobs.gcp_auth) {
+				wait(bstore->ensureBearerToken());
+			}
 			reqStartTimer = g_network->timer();
 
 			// Finish/update the request headers (which includes Date header)
 			// This must be done AFTER the connection is ready because if credentials are coming from disk they are
 			// refreshed when a new connection is established and setAuthHeaders() would need the updated secret.
-			if (bstore->credentials.present() && !bstore->credentials.get().securityToken.empty())
-				req->data.headers["x-amz-security-token"] = bstore->credentials.get().securityToken;
-			if (CLIENT_KNOBS->HTTP_REQUEST_AWS_V4_HEADER) {
-				bstore->setV4AuthHeaders(verb, resource, req->data.headers);
+			if (bstore->knobs.gcp_auth) {
+				bstore->setBearerAuthHeaders(req->data.headers);
 			} else {
-				bstore->setAuthHeaders(verb, resource, req->data.headers);
+				if (bstore->credentials.present() && !bstore->credentials.get().securityToken.empty())
+					req->data.headers["x-amz-security-token"] = bstore->credentials.get().securityToken;
+				if (CLIENT_KNOBS->HTTP_REQUEST_AWS_V4_HEADER) {
+					bstore->setV4AuthHeaders(verb, resource, req->data.headers);
+				} else {
+					bstore->setAuthHeaders(verb, resource, req->data.headers);
+				}
 			}
 
 			std::vector<std::string> queryParameters;
@@ -1007,6 +1174,9 @@ ACTOR Future<Reference<HTTP::IncomingResponse>> doRequest_impl(Reference<S3BlobS
 
 		// All errors in err are potentially retryable as well as certain HTTP response codes...
 		bool retryable = err.present() || r->code == 500 || r->code == 502 || r->code == 503 || r->code == 429;
+		// Not being able to get a token from the metadata server is a deployment problem that retries will not fix.
+		if (bstore->knobs.gcp_auth && err.present() && err.get().code() == error_code_backup_auth_missing)
+			retryable = false;
 
 		// But only if our previous attempt was not the last allowable try.
 		retryable = retryable && (thisTry < maxTries);
@@ -1912,6 +2082,64 @@ TEST_CASE("/backup/s3/v4headers") {
 		ASSERT(headers["Content-Type"] == "Application/x-amz-json-1.0");
 	}
 
+	return Void();
+}
+
+TEST_CASE("/backup/s3/gcp_token_response") {
+	std::string token;
+	double expiresIn = 0;
+	std::string err;
+
+	ASSERT(S3BlobStoreEndpoint::parseGcpTokenResponse(
+	    "{\"access_token\":\"ya29.token\",\"expires_in\":3599,\"token_type\":\"Bearer\"}", token, expiresIn, &err));
+	ASSERT(token == "ya29.token");
+	ASSERT(expiresIn == 3599);
+
+	ASSERT(S3BlobStoreEndpoint::parseGcpTokenResponse(
+	    "{\"access_token\":\"t\",\"expires_in\":\"300\"}", token, expiresIn, &err));
+	ASSERT(token == "t");
+	ASSERT(expiresIn == 300);
+
+	ASSERT(!S3BlobStoreEndpoint::parseGcpTokenResponse("{\"expires_in\":3599}", token, expiresIn, &err));
+	ASSERT(!S3BlobStoreEndpoint::parseGcpTokenResponse("{\"access_token\":\"t\"}", token, expiresIn, &err));
+	ASSERT(!S3BlobStoreEndpoint::parseGcpTokenResponse(
+	    "{\"access_token\":\"\",\"expires_in\":10}", token, expiresIn, &err));
+	ASSERT(!S3BlobStoreEndpoint::parseGcpTokenResponse(
+	    "{\"access_token\":\"t\",\"expires_in\":\"soon\"}", token, expiresIn, &err));
+	ASSERT(!S3BlobStoreEndpoint::parseGcpTokenResponse("not json", token, expiresIn, &err));
+	ASSERT(!S3BlobStoreEndpoint::parseGcpTokenResponse("[1,2]", token, expiresIn, &err));
+	return Void();
+}
+
+TEST_CASE("/backup/s3/gcp_auth_url") {
+	// state: the try/catch below is compiled into a separate continuation by the actor compiler
+	state std::string err;
+	// non-knob parameters such as bucket are handed back to the caller through this map
+	state S3BlobStoreEndpoint::ParametersT ignored;
+
+	// gcp_auth needs neither credentials nor a region and survives a URL round trip
+	state Reference<S3BlobStoreEndpoint> b = S3BlobStoreEndpoint::fromString(
+	    "blobstore://storage.googleapis.com/fdb?bucket=b&gcp_auth=1", {}, nullptr, &err, &ignored);
+	ASSERT(b->knobs.gcp_auth == 1);
+	ASSERT(!b->credentials.present());
+	ASSERT(ignored["bucket"] == "b");
+	ASSERT(b->getResourceURL("fdb", "bucket=b").find("ga=1") != std::string::npos);
+
+	HTTP::Headers headers;
+	b->bearerToken = "tok";
+	b->setBearerAuthHeaders(headers);
+	ASSERT(headers["Authorization"] == "Bearer tok");
+	ASSERT(!headers["Date"].empty());
+
+	// credentials in the URL contradict gcp_auth
+	try {
+		S3BlobStoreEndpoint::fromString(
+		    "blobstore://k:s@storage.googleapis.com/fdb?bucket=b&ga=1", {}, nullptr, &err, &ignored);
+		ASSERT(false);
+	} catch (Error& e) {
+		ASSERT(e.code() == error_code_backup_invalid_url);
+		ASSERT(err.find("remove the credentials") != std::string::npos);
+	}
 	return Void();
 }
 

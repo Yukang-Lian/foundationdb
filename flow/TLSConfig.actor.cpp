@@ -106,6 +106,29 @@ void LoadedTLSConfig::print(FILE* fp) {
 	X509_STORE_CTX_free(store_ctx);
 }
 
+// With no CA configured, trust the operating system's CA store so that TLS connections to public endpoints (for
+// example https blob store backups) can still be verified. OpenSSL's default paths honor SSL_CERT_FILE/SSL_CERT_DIR;
+// the well-known bundle locations cover distributions whose paths differ from the OpenSSL build's OPENSSLDIR.
+static void loadSystemCertificateAuthorities(boost::asio::ssl::context& context) {
+	static const char* bundles[] = { "/etc/ssl/certs/ca-certificates.crt",
+		                             "/etc/pki/tls/certs/ca-bundle.crt",
+		                             "/etc/ssl/ca-bundle.pem",
+		                             "/etc/pki/tls/cacert.pem",
+		                             "/etc/ssl/cert.pem" };
+	boost::system::error_code ec;
+	context.set_default_verify_paths(ec);
+	for (const char* bundle : bundles) {
+		if (fileExists(bundle)) {
+			context.load_verify_file(bundle, ec);
+			TraceEvent("TLSUsingSystemCA").detail("Path", bundle).detail("ErrorCode", ec.value());
+			if (!ec) {
+				return;
+			}
+		}
+	}
+	TraceEvent(SevWarn, "TLSNoCAAvailable").detail("Reason", "no CA configured and no system CA bundle found");
+}
+
 void ConfigureSSLContext(const LoadedTLSConfig& loaded, boost::asio::ssl::context& context) {
 	try {
 		context.set_options(boost::asio::ssl::context::default_workarounds);
@@ -121,6 +144,8 @@ void ConfigureSSLContext(const LoadedTLSConfig& loaded, boost::asio::ssl::contex
 		const std::string& CABytes = loaded.getCABytes();
 		if (CABytes.size()) {
 			context.add_certificate_authority(boost::asio::buffer(CABytes.data(), CABytes.size()));
+		} else {
+			loadSystemCertificateAuthorities(context);
 		}
 
 		const std::string& keyBytes = loaded.getKeyBytes();

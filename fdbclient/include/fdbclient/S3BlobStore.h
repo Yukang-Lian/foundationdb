@@ -147,7 +147,7 @@ public:
 		    concurrent_uploads, concurrent_lists, concurrent_reads_per_file, concurrent_writes_per_file,
 		    enable_read_cache, read_block_size, read_ahead_blocks, read_cache_blocks_per_file,
 		    max_send_bytes_per_second, max_recv_bytes_per_second, sdk_auth, global_connection_pool,
-		    max_delay_retryable_error, max_delay_connection_failed;
+		    max_delay_retryable_error, max_delay_connection_failed, gcp_auth;
 
 		bool set(StringRef name, int value);
 		std::string getURLParameters() const;
@@ -187,7 +187,10 @@ public:
 				"failure.",
 				"sdk_auth (or sa)                      Use AWS SDK to resolve credentials. Only valid if "
 				"BUILD_AWS_BACKUP is enabled.",
-				"global_connection_pool (or gcp)       Enable shared connection pool between all blobstore instances."
+				"global_connection_pool (or gcp)       Enable shared connection pool between all blobstore instances.",
+				"gcp_auth (or ga)                      Set 1 to authenticate with OAuth2 access tokens from the GCE/GKE "
+				"metadata server (VM service account or Workload Identity) instead of HMAC keys. Google Cloud Storage "
+				"only."
 			};
 		}
 
@@ -294,6 +297,12 @@ public:
 	BlobKnobs knobs;
 	HTTP::Headers extraHeaders;
 
+	// OAuth2 bearer token used instead of AWS signatures when knobs.gcp_auth is set. Fetched from the GCE/GKE
+	// metadata server and refreshed before it expires.
+	std::string bearerToken;
+	double bearerTokenExpiration = 0;
+	Future<Void> bearerTokenRefresh;
+
 	// Speed and concurrency limits
 	Reference<IRateControl> requestRate;
 	Reference<IRateControl> requestRateList;
@@ -307,6 +316,18 @@ public:
 	FlowLock concurrentLists;
 
 	Future<Void> updateSecret();
+
+	// Completes once a bearer token with a safe amount of lifetime left is held, fetching a new one if needed.
+	Future<Void> ensureBearerToken();
+
+	// Sets the Authorization and Date headers for bearer token auth, used in place of setAuthHeaders/setV4AuthHeaders
+	void setBearerAuthHeaders(HTTP::Headers& headers);
+
+	// Parses the JSON token response of the GCE metadata server (access_token, expires_in)
+	static bool parseGcpTokenResponse(std::string const& body,
+	                                  std::string& token,
+	                                  double& expiresIn,
+	                                  std::string* error = nullptr);
 
 	// Calculates the authentication string from the secret key
 	static std::string hmac_sha1(Credentials const& creds, std::string const& msg);

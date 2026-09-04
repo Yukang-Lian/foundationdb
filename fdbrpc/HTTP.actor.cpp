@@ -820,7 +820,7 @@ ACTOR Future<Reference<IConnection>> proxyConnectImpl(std::string remoteHost,
 	state NetworkAddress remoteEndpoint =
 	    wait(map(INetworkConnections::net()->resolveTCPEndpoint(remoteHost, remoteService),
 	             [=](std::vector<NetworkAddress> const& addresses) -> NetworkAddress {
-		             NetworkAddress addr = addresses[deterministicRandom()->randomInt(0, addresses.size())];
+		             NetworkAddress addr = INetworkConnections::pickOneAddress(addresses);
 		             addr.fromHostname = true;
 		             addr.flags = NetworkAddress::FLAG_TLS;
 		             return addr;
@@ -829,6 +829,9 @@ ACTOR Future<Reference<IConnection>> proxyConnectImpl(std::string remoteHost,
 	wait(sendProxyConnectRequest(connection, remoteHost, remoteService));
 	boost::asio::ip::tcp::socket socket = std::move(connection->getSocket());
 	Reference<IConnection> remoteConnection = wait(INetworkConnections::net()->connect(remoteEndpoint, &socket));
+	if (!IPAddress::parse(remoteHost).present()) {
+		remoteConnection->setServerName(remoteHost);
+	}
 	return remoteConnection;
 }
 

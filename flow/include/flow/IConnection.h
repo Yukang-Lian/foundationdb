@@ -47,6 +47,9 @@ public:
 
 	virtual Future<Void> connectHandshake() = 0;
 
+	// Host name sent as TLS SNI in the client handshake. Plain connections ignore it.
+	virtual void setServerName(const std::string& host) {}
+
 	// Precondition: write() has been called and last returned 0
 	// returns when write() can write at least one byte (or may throw an error if the connection dies)
 	virtual Future<Void> onWritable() = 0;

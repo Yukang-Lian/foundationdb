@@ -1007,6 +1007,9 @@ public:
 
 		try {
 			Future<Void> onHandshook;
+			if (!self->serverName.empty()) {
+				SSL_set_tlsext_host_name(self->ssl_sock.native_handle(), self->serverName.c_str());
+			}
 			ConfigureSSLStream(N2::g_net2->activeTlsPolicy, self->ssl_sock, [conn = self.getPtr()](bool verifyOk) {
 				conn->has_trusted_peer = verifyOk;
 			});
@@ -1157,6 +1160,8 @@ public:
 
 	ssl_socket& getSSLSocket() { return ssl_sock; }
 
+	void setServerName(const std::string& host) override { serverName = host; }
+
 private:
 	UID id;
 	tcp::socket socket;
@@ -1164,6 +1169,7 @@ private:
 	NetworkAddress peer_address;
 	Reference<ReferencedObject<boost::asio::ssl::context>> sslContext;
 	bool has_trusted_peer;
+	std::string serverName;
 
 	void init() {
 		// Socket settings that have to be set after connect or accept succeeds
