@@ -188,9 +188,9 @@ public:
 				"sdk_auth (or sa)                      Use AWS SDK to resolve credentials. Only valid if "
 				"BUILD_AWS_BACKUP is enabled.",
 				"global_connection_pool (or gcp)       Enable shared connection pool between all blobstore instances.",
-				"gcp_auth (or ga)                      Set 1 to authenticate with OAuth2 access tokens from the GCE/GKE "
-				"metadata server (VM service account or Workload Identity) instead of HMAC keys. Google Cloud Storage "
-				"only."
+				"gcp_auth (or ga)                      Set 1 to authenticate with OAuth2 access tokens from the Google Cloud "
+				"SDK's application default credentials (GCE/GKE service accounts, GOOGLE_APPLICATION_CREDENTIALS) "
+				"instead of HMAC keys. Google Cloud Storage only; needs a build with BUILD_GCP_BACKUP."
 			};
 		}
 
@@ -301,6 +301,7 @@ public:
 	// metadata server and refreshed before it expires.
 	std::string bearerToken;
 	double bearerTokenExpiration = 0;
+	double bearerTokenRefreshNotBefore = 0;
 	Future<Void> bearerTokenRefresh;
 
 	// Speed and concurrency limits
@@ -322,12 +323,6 @@ public:
 
 	// Sets the Authorization and Date headers for bearer token auth, used in place of setAuthHeaders/setV4AuthHeaders
 	void setBearerAuthHeaders(HTTP::Headers& headers);
-
-	// Parses the JSON token response of the GCE metadata server (access_token, expires_in)
-	static bool parseGcpTokenResponse(std::string const& body,
-	                                  std::string& token,
-	                                  double& expiresIn,
-	                                  std::string* error = nullptr);
 
 	// Calculates the authentication string from the secret key
 	static std::string hmac_sha1(Credentials const& creds, std::string const& msg);

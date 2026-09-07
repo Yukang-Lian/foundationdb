@@ -419,8 +419,9 @@ BackupContainerAzureBlobStore::BackupContainerAzureBlobStore(const std::string& 
 		std::string accountKey = _accountKey;
 		credential = std::make_shared<azure::storage_lite::shared_key_credential>(accountName, accountKey);
 	} else {
-		// OAuth bearer token authentication (managed identity or workload identity).  The
-		// credential starts out with an empty token; the initial fetch is queued as the first
+		// OAuth bearer token authentication through the Azure Identity SDK (managed identity,
+		// workload identity or the SDK's default credential chain).  The credential starts out
+		// with an empty token; the initial fetch is queued as the first
 		// task on this container's AsyncTaskThread, so every subsequent operation on the
 		// container naturally runs after a token has been installed.
 		tokenCredential = std::make_shared<azure::storage_lite::token_credential>("");

@@ -171,7 +171,7 @@ Here is a complete list of valid parameters:
 
  *sdk_auth* (or *sa*) - Use the AWS SDK to do credentials and authentication. This supports all aws authentication types, including credential-less iam role-based authentication in aws. Experimental, and only works if FDB was compiled with BUILD_AWS_BACKUP=ON. When this parameter is set, all other credential parts of the backup url can be ignored.
 
- *gcp_auth* (or *ga*) - Set to 1 to authenticate to Google Cloud Storage with OAuth2 access tokens obtained from the GCE/GKE metadata server (the service account attached to the VM, or GKE Workload Identity) instead of HMAC keys.  The URL must not contain credentials and needs no ``region``.  Tokens are refreshed automatically before they expire.  The environment variable ``FDB_GCE_METADATA_ENDPOINT`` (``host[:port]``) overrides the metadata server address, which is only useful for testing.
+ *gcp_auth* (or *ga*) - Set to 1 to authenticate to Google Cloud Storage with OAuth2 access tokens from the Google Cloud SDK's application default credentials instead of HMAC keys: the service account of the GCE VM or GKE pod (Workload Identity) through the metadata server, or the file named by ``GOOGLE_APPLICATION_CREDENTIALS`` (service account key or external account).  The URL must not contain credentials and needs no ``region``.  Tokens are refreshed automatically before they expire.  Requires a build with ``BUILD_GCP_BACKUP=ON``.  The SDK's environment variables apply, e.g. ``GCE_METADATA_ROOT`` overrides the metadata server address.
  
   **Example**: The URL parameter *header=x-amz-storage-class:REDUCED_REDUNDANCY* would send the HTTP header required to use the reduced redundancy storage option in the S3 API.
 
@@ -200,11 +200,13 @@ Authentication is selected with the ``FDB_AZURE_AUTH_MODE`` environment variable
 
  *shared_key* (or unset) - Storage account Shared Key authentication.  The account key is taken from the ``AZURE_KEY`` environment variable.  This is the original behavior.
 
- *managed_identity* - Requests OAuth tokens for ``https://storage.azure.com/`` from the Azure Instance Metadata Service of the VM the process runs on.  The optional ``FDB_AZURE_CLIENT_ID`` environment variable selects a user-assigned managed identity; without it the system-assigned identity is used.  The identity needs the ``Storage Blob Data Contributor`` role on the target container or account.
+ *managed_identity* - Azure Identity SDK ``ManagedIdentityCredential``: OAuth tokens for ``https://storage.azure.com/`` from the managed identity of the VM/VMSS (through the Instance Metadata Service) or of the App Service, Azure Arc, Service Fabric or Cloud Shell environment the SDK detects.  The optional ``FDB_AZURE_CLIENT_ID`` environment variable selects a user-assigned managed identity; without it the system-assigned identity is used.  The identity needs the ``Storage Blob Data Contributor`` role on the target container or account.
 
- *workload_identity* - Requests OAuth tokens using the federated service account token projected by Azure Workload Identity (e.g. on AKS), via the standard ``AZURE_CLIENT_ID``, ``AZURE_TENANT_ID``, ``AZURE_FEDERATED_TOKEN_FILE`` and ``AZURE_AUTHORITY_HOST`` environment variables.
+ *workload_identity* - Azure Identity SDK ``WorkloadIdentityCredential``: OAuth tokens obtained with the federated service account token projected by Azure Workload Identity (e.g. on AKS), via the standard ``AZURE_CLIENT_ID``, ``AZURE_TENANT_ID``, ``AZURE_FEDERATED_TOKEN_FILE`` and ``AZURE_AUTHORITY_HOST`` environment variables.
 
-Tokens are refreshed automatically before they expire for as long as the process keeps the backup container open.
+ *default* - Azure Identity SDK ``DefaultAzureCredential``: the SDK's standard credential chain (environment client secret or certificate, workload identity, managed identity, Azure CLI), for environments where the identity type is not known in advance.
+
+The token modes are implemented with the Azure Identity SDK, so its environment variables apply: for example ``AZURE_POD_IDENTITY_AUTHORITY_HOST`` overrides the Instance Metadata Service address.  The Instance Metadata Service is link-local; when the environment configures an HTTP proxy, exclude it with ``NO_PROXY=169.254.169.254``.  Tokens are refreshed automatically before they expire for as long as the process keeps the backup container open.
 
 .. _blob-credential-files:
 

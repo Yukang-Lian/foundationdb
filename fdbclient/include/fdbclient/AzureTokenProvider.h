@@ -26,22 +26,28 @@
 
 // How the Azure Blob backup container authenticates against Azure Storage.
 //
-// SHARED_KEY is the original behavior: the storage account key is taken from the
-// AZURE_KEY environment variable and requests are signed with it.
+// SHARED_KEY is the original behavior: the storage account key is taken from the AZURE_KEY
+// environment variable and requests are signed with it.
 //
-// MANAGED_IDENTITY obtains an OAuth bearer token for https://storage.azure.com/ from the
-// Azure Instance Metadata Service (IMDS) of the VM/VMSS the process runs on.  The optional
-// FDB_AZURE_CLIENT_ID environment variable selects a user-assigned identity.
-//
-// WORKLOAD_IDENTITY obtains an OAuth bearer token using the federated service account
-// token that Azure Workload Identity (e.g. on AKS) projects into the pod.  It uses the
-// standard environment variables injected by the workload identity webhook:
-// AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_FEDERATED_TOKEN_FILE and AZURE_AUTHORITY_HOST.
+// The other modes obtain OAuth bearer tokens for https://storage.azure.com/ through the Azure
+// Identity SDK (azure-identity), mirroring how the S3 backup delegates credential resolution
+// to the AWS SDK (sdk_auth):
+//   MANAGED_IDENTITY   Azure::Identity::ManagedIdentityCredential: IMDS on VMs/VMSS, plus the
+//                      App Service, Azure Arc, Service Fabric and Cloud Shell identity
+//                      endpoints the SDK detects from their standard environment variables.
+//                      FDB_AZURE_CLIENT_ID selects a user-assigned identity.
+//   WORKLOAD_IDENTITY  Azure::Identity::WorkloadIdentityCredential: the federated service
+//                      account token projected by Azure Workload Identity (e.g. on AKS), via
+//                      the standard AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_FEDERATED_TOKEN_FILE
+//                      and AZURE_AUTHORITY_HOST variables.
+//   DEFAULT            Azure::Identity::DefaultAzureCredential: the SDK's standard chain
+//                      (environment client secret/certificate, workload identity, managed
+//                      identity, Azure CLI).
 //
 // The mode is selected explicitly with the FDB_AZURE_AUTH_MODE environment variable
-// ("shared_key", "managed_identity" or "workload_identity").  There is intentionally no
-// implicit credential chain: an unset variable selects SHARED_KEY, the historical behavior.
-enum class AzureAuthMode { SHARED_KEY, MANAGED_IDENTITY, WORKLOAD_IDENTITY };
+// ("shared_key", "managed_identity", "workload_identity" or "default").  An unset variable
+// selects SHARED_KEY, the historical behavior.
+enum class AzureAuthMode { SHARED_KEY, MANAGED_IDENTITY, WORKLOAD_IDENTITY, DEFAULT };
 
 struct AzureAccessToken {
 	std::string token;
@@ -53,15 +59,13 @@ struct AzureAccessToken {
 // unrecognized value.
 AzureAuthMode azureAuthModeFromEnvironment();
 
-// Fetches a bearer token for scope https://storage.azure.com/ using the given mode, which
-// must not be SHARED_KEY.  This performs a synchronous, blocking network call: it must run
-// on a background thread (e.g. the backup container's AsyncTaskThread), never on the flow
-// network thread.  Throws backup_auth_missing() on failure.
-AzureAccessToken fetchAzureStorageToken(AzureAuthMode mode);
+// Parses a mode name as accepted by FDB_AZURE_AUTH_MODE.  Returns false for unknown names.
+bool parseAzureAuthMode(const std::string& name, AzureAuthMode& mode);
 
-// Parses an OAuth token response body ({"access_token": ..., "expires_in": ...}) from IMDS
-// (expires_in as a JSON string) or from the AAD v2 token endpoint (expires_in as a JSON
-// number).  Exposed for unit testing.  Throws backup_auth_missing() on malformed input.
-AzureAccessToken parseAzureTokenResponse(const std::string& jsonBody);
+// Fetches a bearer token for scope https://storage.azure.com/.default using the given mode,
+// which must not be SHARED_KEY.  This is a synchronous, blocking call into the Azure Identity
+// SDK: it must run on a background thread (the backup container's AsyncTaskThread), never on
+// the flow network thread.  Throws backup_auth_missing() on failure.
+AzureAccessToken fetchAzureStorageToken(AzureAuthMode mode);
 
 #endif
