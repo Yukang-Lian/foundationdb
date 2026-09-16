@@ -24,6 +24,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -32,62 +33,84 @@
 #include <google/cloud/oauth2/access_token_generator.h>
 #include <google/cloud/options.h>
 
+#include "fdbclient/SystemCaBundle.h"
 #include "flow/Error.h"
-#include "flow/Platform.h"
 
 namespace {
 
-// The libcurl linked into the binary carries the CA bundle path of the build machine, so give
-// the token endpoints the CA bundle of the machine we actually run on.  Same locations as the
-// blobstore TLS client; an empty result leaves the SDK's default in place.
-std::string systemCaBundle() {
-	static const char* bundles[] = { "/etc/ssl/certs/ca-certificates.crt",
-		                             "/etc/pki/tls/certs/ca-bundle.crt",
-		                             "/etc/ssl/ca-bundle.pem",
-		                             "/etc/pki/tls/cacert.pem",
-		                             "/etc/ssl/cert.pem" };
-	for (const char* bundle : bundles) {
-		if (fileExists(bundle)) {
-			return bundle;
-		}
+// Same scopes as the Doris object storage client: tokens used against Cloud Storage are limited to storage, and
+// when impersonating, the source credential needs cloud-platform to call the IAM Credentials API.
+const char* STORAGE_SCOPE = "https://www.googleapis.com/auth/devstorage.read_write";
+const char* CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform";
+
+std::shared_ptr<google::cloud::Credentials> makeCredentials(const GcpCredentialConfig& config) {
+	google::cloud::Options options;
+	std::string caBundle = systemCaBundle();
+	if (!caBundle.empty()) {
+		options.set<google::cloud::CARootsFilePathOption>(caBundle);
 	}
-	return "";
+	bool impersonate = !config.impersonationServiceAccount.empty();
+	options.set<google::cloud::ScopesOption>({ impersonate ? CLOUD_PLATFORM_SCOPE : STORAGE_SCOPE });
+
+	std::shared_ptr<google::cloud::Credentials> credentials;
+	switch (config.providerType) {
+	case GcpCredentialProviderType::DEFAULT:
+		credentials = google::cloud::MakeGoogleDefaultCredentials(options);
+		break;
+	case GcpCredentialProviderType::COMPUTE_ENGINE:
+		credentials = google::cloud::MakeComputeEngineCredentials(options);
+		break;
+	}
+	if (impersonate) {
+		google::cloud::Options impersonationOptions = options;
+		impersonationOptions.set<google::cloud::ScopesOption>({ STORAGE_SCOPE });
+		credentials = google::cloud::MakeImpersonateServiceAccountCredentials(
+		    std::move(credentials), config.impersonationServiceAccount, std::move(impersonationOptions));
+	}
+	return credentials;
 }
 
-// One generator for the lifetime of the process: the SDK credentials cache their tokens and
-// refresh them internally, which a fresh generator per call would defeat.
-std::shared_ptr<google::cloud::oauth2::AccessTokenGenerator> tokenGenerator() {
+// One generator per distinct configuration, shared by every endpoint of the process, so the SDK's token cache is
+// reused and the IAM Credentials API is not called more often than necessary.
+std::shared_ptr<google::cloud::oauth2::AccessTokenGenerator> tokenGenerator(const GcpCredentialConfig& config) {
 	static std::mutex mutex;
-	static std::shared_ptr<google::cloud::oauth2::AccessTokenGenerator> generator;
+	static std::map<std::string, std::shared_ptr<google::cloud::oauth2::AccessTokenGenerator>> generators;
 	std::lock_guard<std::mutex> lock(mutex);
+	std::string key =
+	    std::string(gcpCredentialProviderTypeName(config.providerType)) + "|" + config.impersonationServiceAccount;
+	std::shared_ptr<google::cloud::oauth2::AccessTokenGenerator>& generator = generators[key];
 	if (!generator) {
-		google::cloud::Options options;
-		std::string caBundle = systemCaBundle();
-		if (!caBundle.empty()) {
-			options.set<google::cloud::CARootsFilePathOption>(caBundle);
-		}
-		std::shared_ptr<google::cloud::Credentials> credentials = google::cloud::MakeGoogleDefaultCredentials(options);
+		std::shared_ptr<google::cloud::Credentials> credentials = makeCredentials(config);
 		generator = google::cloud::oauth2::MakeAccessTokenGenerator(*credentials);
 	}
 	return generator;
 }
 
+std::string describe(const GcpCredentialConfig& config) {
+	std::string s = gcpCredentialProviderTypeName(config.providerType);
+	if (!config.impersonationServiceAccount.empty()) {
+		s += " impersonating " + config.impersonationServiceAccount;
+	}
+	return s;
+}
+
 } // namespace
 
-GcpAccessToken fetchGcpStorageToken() {
+GcpAccessToken fetchGcpStorageToken(const GcpCredentialConfig& config) {
 	try {
-		google::cloud::StatusOr<google::cloud::AccessToken> token = tokenGenerator()->GetToken();
+		google::cloud::StatusOr<google::cloud::AccessToken> token = tokenGenerator(config)->GetToken();
 		if (!token) {
 			fprintf(stderr,
-			        "Google Cloud application default credentials failed: %s\n",
+			        "Google Cloud credentials (%s) failed: %s\n",
+			        describe(config).c_str(),
 			        token.status().message().c_str());
 			throw backup_auth_missing();
 		}
-		double expiresIn =
-		    std::chrono::duration<double>(token->expiration - std::chrono::system_clock::now()).count();
+		double expiresIn = std::chrono::duration<double>(token->expiration - std::chrono::system_clock::now()).count();
 		if (token->token.empty() || expiresIn <= 0) {
 			fprintf(stderr,
-			        "Google Cloud credentials returned an unusable token (expires in %.0f seconds)\n",
+			        "Google Cloud credentials (%s) returned an unusable token (expires in %.0f seconds)\n",
+			        describe(config).c_str(),
 			        expiresIn);
 			throw backup_auth_missing();
 		}
@@ -95,7 +118,7 @@ GcpAccessToken fetchGcpStorageToken() {
 	} catch (Error&) {
 		throw;
 	} catch (std::exception& e) {
-		fprintf(stderr, "Google Cloud credentials failed: %s\n", e.what());
+		fprintf(stderr, "Google Cloud credentials (%s) failed: %s\n", describe(config).c_str(), e.what());
 		throw backup_auth_missing();
 	}
 }

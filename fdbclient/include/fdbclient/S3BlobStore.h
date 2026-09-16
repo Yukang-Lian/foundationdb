@@ -31,6 +31,8 @@
 #include "fdbrpc/HTTP.h"
 #include "fdbrpc/Stats.h"
 #include "fdbclient/JSONDoc.h"
+#include "fdbclient/FDBAWSCredentialsProvider.h"
+#include "fdbclient/GcpTokenProvider.h"
 #include "flow/IConnection.h"
 
 #include <boost/functional/hash.hpp>
@@ -186,11 +188,16 @@ public:
 				"max_delay_connection_failed (or dcf)  Max seconds to delay before retry when see a connection "
 				"failure.",
 				"sdk_auth (or sa)                      Use AWS SDK to resolve credentials. Only valid if "
-				"BUILD_AWS_BACKUP is enabled.",
+				"BUILD_AWS_BACKUP is enabled. The string parameters role_arn=<arn> (STS AssumeRole into that role), "
+				"external_id=<id> (its external ID) and credentials_provider_type=DEFAULT|ENV|SYSTEM_PROPERTIES|"
+				"WEB_IDENTITY|CONTAINER|INSTANCE_PROFILE (which SDK provider supplies the base credentials) refine "
+				"it and imply sdk_auth=1.",
 				"global_connection_pool (or gcp)       Enable shared connection pool between all blobstore instances.",
 				"gcp_auth (or ga)                      Set 1 to authenticate with OAuth2 access tokens from the Google Cloud "
-				"SDK's application default credentials (GCE/GKE service accounts, GOOGLE_APPLICATION_CREDENTIALS) "
-				"instead of HMAC keys. Google Cloud Storage only; needs a build with BUILD_GCP_BACKUP."
+				"SDK instead of HMAC keys. Google Cloud Storage only; needs a build with BUILD_GCP_BACKUP. The string "
+				"parameters gcp_credential_provider_type=DEFAULT|COMPUTE_ENGINE (application default credentials, or "
+				"only the GCE/GKE metadata server) and gcp_impersonation_service_account=<email> (act as that service "
+				"account) refine it and imply gcp_auth=1."
 			};
 		}
 
@@ -297,12 +304,16 @@ public:
 	BlobKnobs knobs;
 	HTTP::Headers extraHeaders;
 
-	// OAuth2 bearer token used instead of AWS signatures when knobs.gcp_auth is set. Fetched from the GCE/GKE
-	// metadata server and refreshed before it expires.
+	// OAuth2 bearer token used instead of AWS signatures when knobs.gcp_auth is set. Obtained through the Google
+	// Cloud SDK as configured by gcpCredentials and refreshed before it expires.
 	std::string bearerToken;
 	double bearerTokenExpiration = 0;
 	double bearerTokenRefreshNotBefore = 0;
 	Future<Void> bearerTokenRefresh;
+	// From the gcp_credential_provider_type and gcp_impersonation_service_account URL parameters.
+	GcpCredentialConfig gcpCredentials;
+	// From the role_arn, external_id and credentials_provider_type URL parameters (sdk_auth), plus the region.
+	AwsCredentialConfig awsCredentials;
 
 	// Speed and concurrency limits
 	Reference<IRateControl> requestRate;

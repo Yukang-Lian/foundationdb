@@ -39,9 +39,7 @@
 #include "flow/Hostname.h"
 #include "flow/UnitTest.h"
 #include "rapidxml/rapidxml.hpp"
-#ifdef WITH_AWS_BACKUP
 #include "fdbclient/FDBAWSCredentialsProvider.h"
-#endif
 
 #include "flow/actorcompiler.h" // has to be last include
 
@@ -249,8 +247,12 @@ Reference<S3BlobStoreEndpoint> S3BlobStoreEndpoint::fromString(const std::string
 			proxyPort = p.eat().toString();
 		}
 
+		// Credentials precede the host as <key>:<secret>[:<token>]@. An '@' after the start of the query string
+		// belongs to a parameter value, such as the service account email of gcp_impersonation_service_account.
 		Optional<StringRef> cred;
-		if (url.find("@") != std::string::npos) {
+		size_t atPos = url.find("@");
+		size_t queryPos = url.find("?");
+		if (atPos != std::string::npos && (queryPos == std::string::npos || atPos < queryPos)) {
 			cred = t.eat("@");
 		}
 		uint8_t foundSeparator = 0;
@@ -272,6 +274,10 @@ Reference<S3BlobStoreEndpoint> S3BlobStoreEndpoint::fromString(const std::string
 
 		BlobKnobs knobs;
 		HTTP::Headers extraHeaders;
+		GcpCredentialConfig gcpCredentials;
+		bool gcpCredentialParams = false;
+		AwsCredentialConfig awsCredentials;
+		bool awsCredentialParams = false;
 		while (1) {
 			StringRef name = t.eat("=");
 			if (name.size() == 0)
@@ -302,6 +308,60 @@ Reference<S3BlobStoreEndpoint> S3BlobStoreEndpoint::fromString(const std::string
 			// overwrite s3 region from parameter
 			if (name == "region"_sr) {
 				region = value.toString();
+				continue;
+			}
+
+			// Google Cloud credential settings. String valued, so not knobs; they mirror the
+			// gcs.credential_provider_type and gcs.impersonation_service_account settings of Doris.
+			if (name == "gcp_credential_provider_type"_sr) {
+				if (!parseGcpCredentialProviderType(value.toString(), &gcpCredentials.providerType)) {
+					throw format("'%s' is not a valid value for gcp_credential_provider_type, expected DEFAULT or "
+					             "COMPUTE_ENGINE",
+					             value.toString().c_str());
+				}
+				gcpCredentialParams = true;
+				continue;
+			}
+			// AWS credential settings for sdk_auth. String valued, so not knobs; they mirror the s3.role_arn,
+			// s3.external_id and s3.credentials_provider_type settings of Doris.
+			if (name == "role_arn"_sr) {
+				if (value.toString().find("arn:") != 0) {
+					throw format("'%s' is not a valid value for role_arn, expected an IAM role ARN such as "
+					             "arn:aws:iam::123456789012:role/name",
+					             value.toString().c_str());
+				}
+				awsCredentials.roleArn = value.toString();
+				awsCredentialParams = true;
+				continue;
+			}
+			if (name == "external_id"_sr) {
+				awsCredentials.externalId = value.toString();
+				awsCredentialParams = true;
+				continue;
+			}
+			if (name == "credentials_provider_type"_sr) {
+				if (!parseAwsCredentialProviderType(value.toString(), &awsCredentials.providerType)) {
+					throw format("'%s' is not a valid value for credentials_provider_type, expected DEFAULT, ENV, "
+					             "SYSTEM_PROPERTIES, WEB_IDENTITY, CONTAINER or INSTANCE_PROFILE",
+					             value.toString().c_str());
+				}
+				awsCredentialParams = true;
+				continue;
+			}
+			if (name == "gcp_impersonation_service_account"_sr) {
+				// accept the '@' either literally or URL-encoded as %40
+				std::string account = value.toString();
+				size_t encoded = account.find("%40");
+				if (encoded != std::string::npos) {
+					account.replace(encoded, 3, "@");
+				}
+				if (!isValidGcpServiceAccountEmail(account)) {
+					throw format("'%s' is not a valid value for gcp_impersonation_service_account, expected a service "
+					             "account email such as name@project.iam.gserviceaccount.com",
+					             value.toString().c_str());
+				}
+				gcpCredentials.impersonationServiceAccount = account;
+				gcpCredentialParams = true;
 				continue;
 			}
 
@@ -345,9 +405,30 @@ Reference<S3BlobStoreEndpoint> S3BlobStoreEndpoint::fromString(const std::string
 			creds = S3BlobStoreEndpoint::Credentials{ key.toString(), secret.toString(), securityToken.toString() };
 		}
 
+		// The Google Cloud credential parameters select token auth by themselves, as gcs.credential_provider_type
+		// does in Doris.
+		if (gcpCredentialParams) {
+			knobs.gcp_auth = 1;
+		}
 		if (knobs.gcp_auth && creds.present()) {
-			throw std::string("gcp_auth=1 authenticates with tokens from the GCE/GKE metadata server, remove the "
-			                  "credentials from the URL");
+			throw std::string(
+			    "gcp_auth authenticates with Google Cloud access tokens, remove the credentials from the URL");
+		}
+		// The AWS credential parameters select sdk_auth by themselves, as role_arn does in Doris, and like there
+		// they cannot be combined with access keys.
+		if (awsCredentialParams) {
+			if (!awsCredentials.externalId.empty() && awsCredentials.roleArn.empty()) {
+				throw std::string("external_id requires role_arn");
+			}
+			if (creds.present()) {
+				throw std::string("role_arn, external_id and credentials_provider_type resolve credentials with the "
+				                  "AWS SDK, remove the credentials from the URL");
+			}
+			if (knobs.gcp_auth) {
+				throw std::string("role_arn, external_id and credentials_provider_type are AWS settings and cannot be "
+				                  "combined with gcp_auth");
+			}
+			knobs.sdk_auth = 1;
 		}
 
 		// Bearer token auth does not sign requests, so it needs no region.
@@ -356,8 +437,12 @@ Reference<S3BlobStoreEndpoint> S3BlobStoreEndpoint::fromString(const std::string
 			    "Failed to get region from host or parameter in url, region is required for aws v4 signature");
 		}
 
-		return makeReference<S3BlobStoreEndpoint>(
+		Reference<S3BlobStoreEndpoint> endpoint = makeReference<S3BlobStoreEndpoint>(
 		    host.toString(), service.toString(), region, proxyHost, proxyPort, creds, knobs, extraHeaders);
+		endpoint->gcpCredentials = gcpCredentials;
+		endpoint->awsCredentials = awsCredentials;
+		endpoint->awsCredentials.region = region;
+		return endpoint;
 
 	} catch (std::string& err) {
 		if (error != nullptr)
@@ -379,19 +464,18 @@ std::string S3BlobStoreEndpoint::getResourceURL(std::string resource, std::strin
 	}
 
 	// If secret isn't being looked up from credentials files then it was passed explicitly in the URL so show it here.
+	// Credentials resolved by the cloud SDKs (sdk_auth, gcp_auth) never appear: they are temporary and belong to the
+	// machine's identity, not to the URL.
 	std::string credsString;
-	if (credentials.present()) {
+	if (credentials.present() && !knobs.sdk_auth && !knobs.gcp_auth) {
 		if (!lookupKey) {
 			credsString = credentials.get().key;
 		}
 		if (!lookupSecret) {
 			credsString += ":" + credentials.get().secret;
-		}
-		if (!lookupSecret) {
-			credsString +=
-			    credentials.get().securityToken.empty()
-			        ? std::string(":") + credentials.get().secret
-			        : std::string(":") + credentials.get().secret + std::string(":") + credentials.get().securityToken;
+			if (!credentials.get().securityToken.empty()) {
+				credsString += ":" + credentials.get().securityToken;
+			}
 		}
 		credsString += "@";
 	}
@@ -405,6 +489,49 @@ std::string S3BlobStoreEndpoint::getResourceURL(std::string resource, std::strin
 			params.append("&");
 		}
 		params.append(knobParams);
+	}
+
+	// AWS credential settings that deviate from their defaults
+	if (knobs.sdk_auth) {
+		if (awsCredentials.providerType != AwsCredentialProviderType::DEFAULT) {
+			if (!params.empty()) {
+				params.append("&");
+			}
+			params.append("credentials_provider_type=");
+			params.append(awsCredentialProviderTypeName(awsCredentials.providerType));
+		}
+		if (!awsCredentials.roleArn.empty()) {
+			if (!params.empty()) {
+				params.append("&");
+			}
+			params.append("role_arn=");
+			params.append(awsCredentials.roleArn);
+		}
+		if (!awsCredentials.externalId.empty()) {
+			if (!params.empty()) {
+				params.append("&");
+			}
+			params.append("external_id=");
+			params.append(awsCredentials.externalId);
+		}
+	}
+
+	// Google Cloud credential settings that deviate from their defaults
+	if (knobs.gcp_auth) {
+		if (gcpCredentials.providerType != GcpCredentialProviderType::DEFAULT) {
+			if (!params.empty()) {
+				params.append("&");
+			}
+			params.append("gcp_credential_provider_type=");
+			params.append(gcpCredentialProviderTypeName(gcpCredentials.providerType));
+		}
+		if (!gcpCredentials.impersonationServiceAccount.empty()) {
+			if (!params.empty()) {
+				params.append("&");
+			}
+			params.append("gcp_impersonation_service_account=");
+			params.append(gcpCredentials.impersonationServiceAccount);
+		}
 	}
 
 	for (const auto& [k, v] : extraHeaders) {
@@ -643,15 +770,12 @@ ACTOR Future<Optional<json_spirit::mObject>> tryReadJSONFile(std::string path) {
 }
 
 // If the credentials expire, the connection will eventually fail and be discarded from the pool, and then a new
-// connection will be constructed, which will call this again to get updated credentials
-static S3BlobStoreEndpoint::Credentials getSecretSdk() {
+// connection will be constructed, which will call this again to get updated credentials.
+// Runs on the credential thread (the SDK blocks on the metadata service or STS), so no TraceEvents here.
+static S3BlobStoreEndpoint::Credentials getSecretSdk(const AwsCredentialConfig& config) {
 #ifdef WITH_AWS_BACKUP
-	double elapsed = -timer_monotonic();
-	Aws::Auth::AWSCredentials awsCreds = FDBAWSCredentialsProvider::getAwsCredentials();
-	elapsed += timer_monotonic();
-
+	Aws::Auth::AWSCredentials awsCreds = FDBAWSCredentialsProvider::getAwsCredentials(config);
 	if (awsCreds.IsEmpty()) {
-		TraceEvent(SevWarn, "S3BlobStoreAWSCredsEmpty");
 		throw backup_auth_missing();
 	}
 
@@ -659,38 +783,39 @@ static S3BlobStoreEndpoint::Credentials getSecretSdk() {
 	fdbCreds.key = awsCreds.GetAWSAccessKeyId();
 	fdbCreds.secret = awsCreds.GetAWSSecretKey();
 	fdbCreds.securityToken = awsCreds.GetSessionToken();
-
-	TraceEvent("S3BlobStoreGotSdkCredentials").suppressFor(60).detail("Duration", elapsed);
-
 	return fdbCreds;
 #else
-	TraceEvent(SevError, "S3BlobStoreNoSDK");
 	throw backup_auth_missing();
 #endif
 }
 
-#ifdef WITH_GCP_BACKUP
-// The SDK call blocks, so it runs on a dedicated thread shared by all endpoints of the process.
-// Allocated once and never destroyed: tearing it down during static destruction would race the
+// The cloud SDKs block while resolving credentials, so they run on a dedicated thread shared by all endpoints
+// of the process. Allocated once and never destroyed: tearing it down during static destruction would race the
 // network's own shutdown.
-AsyncTaskThread& gcpTokenThread() {
+AsyncTaskThread& credentialThread() {
 	static AsyncTaskThread* thread = new AsyncTaskThread();
 	return *thread;
 }
-#endif
 
-// Obtains a bearer token for Google Cloud Storage through the Google Cloud SDK's application
-// default credentials (GCE/GKE metadata server on cloud hosts).
+// Obtains a bearer token for Google Cloud Storage through the Google Cloud SDK, from the source credential
+// selected by gcp_credential_provider_type (application default credentials or only the GCE/GKE metadata server),
+// optionally exchanged for a token of the impersonated service account.
 #ifdef WITH_GCP_BACKUP
 ACTOR Future<Void> refreshBearerToken_impl(Reference<S3BlobStoreEndpoint> b) {
 	state int attempt = 0;
+	state GcpCredentialConfig config = b->gcpCredentials;
 	loop {
 		try {
-			GcpAccessToken token = wait(gcpTokenThread().execAsync([] { return fetchGcpStorageToken(); }));
+			// a plain copy for the lambda: state variables live in the actor object and cannot be captured
+			GcpCredentialConfig cfg = config;
+			GcpAccessToken token = wait(credentialThread().execAsync([cfg] { return fetchGcpStorageToken(cfg); }));
 			b->bearerToken = token.token;
 			b->bearerTokenExpiration = now() + token.expiresIn;
 			b->bearerTokenRefreshNotBefore = now() + 30;
-			TraceEvent("S3BlobStoreGcpTokenRefreshed").detail("ExpiresIn", token.expiresIn);
+			TraceEvent("S3BlobStoreGcpTokenRefreshed")
+			    .detail("ExpiresIn", token.expiresIn)
+			    .detail("CredentialProviderType", gcpCredentialProviderTypeName(config.providerType))
+			    .detail("ImpersonationServiceAccount", config.impersonationServiceAccount);
 			return Void();
 		} catch (Error& e) {
 			if (e.code() == error_code_actor_cancelled) {
@@ -700,9 +825,14 @@ ACTOR Future<Void> refreshBearerToken_impl(Reference<S3BlobStoreEndpoint> b) {
 			TraceEvent(SevWarn, "S3BlobStoreGcpTokenRefreshFailed").errorUnsuppressed(e).detail("Attempt", attempt);
 			if (attempt >= 3) {
 				fprintf(stderr,
-				        "ERROR: Unable to obtain Google Cloud credentials for gcp_auth=1 (%s). This needs the "
-				        "GCE/GKE metadata server of a service account, or GOOGLE_APPLICATION_CREDENTIALS.\n",
-				        e.what());
+				        "ERROR: Unable to obtain Google Cloud credentials for gcp_auth (%s, provider %s%s%s). This "
+				        "needs the GCE/GKE metadata server of a service account or, with DEFAULT, "
+				        "GOOGLE_APPLICATION_CREDENTIALS; impersonation also needs roles/iam.serviceAccountTokenCreator "
+				        "on the target service account.\n",
+				        e.what(),
+				        gcpCredentialProviderTypeName(config.providerType),
+				        config.impersonationServiceAccount.empty() ? "" : ", impersonating ",
+				        config.impersonationServiceAccount.c_str());
 				throw backup_auth_missing();
 			}
 			wait(delay(attempt));
@@ -746,7 +876,35 @@ ACTOR Future<Void> updateSecret_impl(Reference<S3BlobStoreEndpoint> b) {
 		return Void();
 	}
 	if (b->knobs.sdk_auth) {
-		b->credentials = getSecretSdk();
+		state AwsCredentialConfig awsConfig = b->awsCredentials;
+		state double sdkStart = timer_monotonic();
+		try {
+			// a plain copy for the lambda: state variables live in the actor object and cannot be captured
+			AwsCredentialConfig cfg = awsConfig;
+			S3BlobStoreEndpoint::Credentials creds =
+			    wait(credentialThread().execAsync([cfg] { return getSecretSdk(cfg); }));
+			b->credentials = creds;
+			TraceEvent("S3BlobStoreGotSdkCredentials")
+			    .suppressFor(60)
+			    .detail("Duration", timer_monotonic() - sdkStart)
+			    .detail("KeyIdSuffix", creds.key.size() > 4 ? creds.key.substr(creds.key.size() - 4) : creds.key)
+			    .detail("CredentialsProviderType", awsCredentialProviderTypeName(awsConfig.providerType))
+			    .detail("RoleArn", awsConfig.roleArn);
+		} catch (Error& e) {
+			if (e.code() == error_code_backup_auth_missing) {
+				TraceEvent(SevWarn, "S3BlobStoreAWSCredsEmpty")
+				    .detail("CredentialsProviderType", awsCredentialProviderTypeName(awsConfig.providerType))
+				    .detail("RoleArn", awsConfig.roleArn);
+				fprintf(stderr,
+				        "ERROR: The AWS SDK returned no credentials for sdk_auth (provider %s%s%s). This needs "
+				        "credentials in the environment, a profile, an EC2 instance role, an ECS task role or a web "
+				        "identity; with role_arn, the base identity also needs sts:AssumeRole on that role.\n",
+				        awsCredentialProviderTypeName(awsConfig.providerType),
+				        awsConfig.roleArn.empty() ? "" : ", assuming ",
+				        awsConfig.roleArn.c_str());
+			}
+			throw;
+		}
 		return Void();
 	}
 	std::vector<std::string>* pFiles = (std::vector<std::string>*)g_network->global(INetwork::enBlobCredentialFiles);
@@ -1102,8 +1260,10 @@ ACTOR Future<Reference<HTTP::IncomingResponse>> doRequest_impl(Reference<S3BlobS
 
 		// All errors in err are potentially retryable as well as certain HTTP response codes...
 		bool retryable = err.present() || r->code == 500 || r->code == 502 || r->code == 503 || r->code == 429;
-		// Not being able to get a token from the metadata server is a deployment problem that retries will not fix.
-		if (bstore->knobs.gcp_auth && err.present() && err.get().code() == error_code_backup_auth_missing)
+		// Not being able to get credentials from the cloud SDK (metadata server, STS AssumeRole, credential files) is
+		// a deployment problem that retries will not fix.
+		if ((bstore->knobs.gcp_auth || bstore->knobs.sdk_auth) && err.present() &&
+		    err.get().code() == error_code_backup_auth_missing)
 			retryable = false;
 
 		// But only if our previous attempt was not the last allowable try.
@@ -2041,6 +2201,152 @@ TEST_CASE("/backup/s3/gcp_auth_url") {
 	} catch (Error& e) {
 		ASSERT(e.code() == error_code_backup_invalid_url);
 		ASSERT(err.find("remove the credentials") != std::string::npos);
+	}
+
+	// the defaults: application default credentials, no impersonation, nothing extra in the URL
+	ASSERT(b->gcpCredentials.providerType == GcpCredentialProviderType::DEFAULT);
+	ASSERT(b->gcpCredentials.impersonationServiceAccount.empty());
+	ASSERT(b->getResourceURL("fdb", "bucket=b").find("gcp_") == std::string::npos);
+
+	// the credential settings imply gcp_auth, are case-insensitive and survive a URL round trip
+	state Reference<S3BlobStoreEndpoint> c = S3BlobStoreEndpoint::fromString(
+	    "blobstore://storage.googleapis.com/fdb?bucket=b&gcp_credential_provider_type=compute_engine"
+	    "&gcp_impersonation_service_account=data-access@proj.iam.gserviceaccount.com",
+	    {},
+	    nullptr,
+	    &err,
+	    &ignored);
+	ASSERT(c->knobs.gcp_auth == 1);
+	ASSERT(c->gcpCredentials.providerType == GcpCredentialProviderType::COMPUTE_ENGINE);
+	ASSERT(c->gcpCredentials.impersonationServiceAccount == "data-access@proj.iam.gserviceaccount.com");
+	state std::string roundTrip = c->getResourceURL("fdb", "bucket=b");
+	ASSERT(roundTrip.find("ga=1") != std::string::npos);
+	ASSERT(roundTrip.find("gcp_credential_provider_type=COMPUTE_ENGINE") != std::string::npos);
+	ASSERT(roundTrip.find("gcp_impersonation_service_account=data-access@proj.iam.gserviceaccount.com") !=
+	       std::string::npos);
+	state Reference<S3BlobStoreEndpoint> d = S3BlobStoreEndpoint::fromString(roundTrip, {}, nullptr, &err, &ignored);
+	ASSERT(d->gcpCredentials.providerType == GcpCredentialProviderType::COMPUTE_ENGINE);
+	ASSERT(d->gcpCredentials.impersonationServiceAccount == c->gcpCredentials.impersonationServiceAccount);
+
+	// the '@' of the email may also be URL-encoded, and credentials before the host still parse when a parameter
+	// value contains an '@'
+	state Reference<S3BlobStoreEndpoint> e = S3BlobStoreEndpoint::fromString(
+	    "blobstore://storage.googleapis.com/fdb?bucket=b&ga=1&gcp_impersonation_service_account=data-access%40proj.iam"
+	    ".gserviceaccount.com",
+	    {},
+	    nullptr,
+	    &err,
+	    &ignored);
+	ASSERT(e->gcpCredentials.impersonationServiceAccount == "data-access@proj.iam.gserviceaccount.com");
+	state Reference<S3BlobStoreEndpoint> f = S3BlobStoreEndpoint::fromString(
+	    "blobstore://key:secret/with/slashes@s3.us-west-2.amazonaws.com/fdb?bucket=b&header=x-note:me@example.com",
+	    {},
+	    nullptr,
+	    &err,
+	    &ignored);
+	ASSERT(f->credentials.present() && f->credentials.get().key == "key" &&
+	       f->credentials.get().secret == "secret/with/slashes");
+	ASSERT(f->host == "s3.us-west-2.amazonaws.com");
+	ASSERT(f->extraHeaders["x-note"] == "me@example.com");
+
+	// unknown provider types and malformed service account emails are rejected
+	try {
+		S3BlobStoreEndpoint::fromString(
+		    "blobstore://storage.googleapis.com/fdb?bucket=b&gcp_credential_provider_type=vm",
+		    {},
+		    nullptr,
+		    &err,
+		    &ignored);
+		ASSERT(false);
+	} catch (Error& e) {
+		ASSERT(e.code() == error_code_backup_invalid_url);
+		ASSERT(err.find("gcp_credential_provider_type") != std::string::npos);
+	}
+	try {
+		S3BlobStoreEndpoint::fromString(
+		    "blobstore://storage.googleapis.com/fdb?bucket=b&ga=1&gcp_impersonation_service_account=not-an-email",
+		    {},
+		    nullptr,
+		    &err,
+		    &ignored);
+		ASSERT(false);
+	} catch (Error& e) {
+		ASSERT(e.code() == error_code_backup_invalid_url);
+		ASSERT(err.find("gcp_impersonation_service_account") != std::string::npos);
+	}
+	ASSERT(isValidGcpServiceAccountEmail("a@b.iam.gserviceaccount.com"));
+	ASSERT(isValidGcpServiceAccountEmail("123-compute@developer.gserviceaccount.com"));
+	ASSERT(!isValidGcpServiceAccountEmail("a@b.example.com"));
+	ASSERT(!isValidGcpServiceAccountEmail("@b.iam.gserviceaccount.com"));
+	ASSERT(!isValidGcpServiceAccountEmail("a b@c.iam.gserviceaccount.com"));
+	return Void();
+}
+
+TEST_CASE("/backup/s3/aws_role_url") {
+	state std::string err;
+	state S3BlobStoreEndpoint::ParametersT ignored;
+
+	// role_arn implies sdk_auth, the settings survive a URL round trip, and the region reaches the STS config
+	state Reference<S3BlobStoreEndpoint> b = S3BlobStoreEndpoint::fromString(
+	    "blobstore://s3.us-west-2.amazonaws.com/fdb?bucket=b&role_arn=arn:aws:iam::123456789012:role/data-access"
+	    "&external_id=ext-1&credentials_provider_type=instance_profile",
+	    {},
+	    nullptr,
+	    &err,
+	    &ignored);
+	ASSERT(b->knobs.sdk_auth == 1);
+	ASSERT(!b->credentials.present());
+	ASSERT(b->awsCredentials.roleArn == "arn:aws:iam::123456789012:role/data-access");
+	ASSERT(b->awsCredentials.externalId == "ext-1");
+	ASSERT(b->awsCredentials.providerType == AwsCredentialProviderType::INSTANCE_PROFILE);
+	ASSERT(b->awsCredentials.region == "us-west-2");
+	state std::string roundTrip = b->getResourceURL("fdb", "bucket=b");
+	ASSERT(roundTrip.find("sa=1") != std::string::npos);
+	ASSERT(roundTrip.find("role_arn=arn:aws:iam::123456789012:role/data-access") != std::string::npos);
+	ASSERT(roundTrip.find("external_id=ext-1") != std::string::npos);
+	ASSERT(roundTrip.find("credentials_provider_type=INSTANCE_PROFILE") != std::string::npos);
+	state Reference<S3BlobStoreEndpoint> c = S3BlobStoreEndpoint::fromString(roundTrip, {}, nullptr, &err, &ignored);
+	ASSERT(c->awsCredentials.roleArn == b->awsCredentials.roleArn);
+	ASSERT(c->awsCredentials.externalId == b->awsCredentials.externalId);
+	ASSERT(c->awsCredentials.providerType == b->awsCredentials.providerType);
+
+	// plain sdk_auth keeps the defaults and adds nothing to the URL, and credentials the SDK resolved later are not
+	// printed into it either
+	state Reference<S3BlobStoreEndpoint> d = S3BlobStoreEndpoint::fromString(
+	    "blobstore://s3.us-west-2.amazonaws.com/fdb?bucket=b&sa=1", {}, nullptr, &err, &ignored);
+	ASSERT(d->awsCredentials.roleArn.empty() && d->awsCredentials.externalId.empty());
+	ASSERT(d->awsCredentials.providerType == AwsCredentialProviderType::DEFAULT);
+	ASSERT(d->getResourceURL("fdb", "bucket=b").find("role_arn") == std::string::npos);
+	ASSERT(d->getResourceURL("fdb", "bucket=b").find("credentials_provider_type") == std::string::npos);
+	d->credentials = S3BlobStoreEndpoint::Credentials{ "ASIAKEY", "secret", "token" };
+	ASSERT(d->getResourceURL("fdb", "bucket=b").find("ASIAKEY") == std::string::npos);
+	ASSERT(d->getResourceURL("fdb", "bucket=b").find("@") == std::string::npos);
+
+	// explicit credentials are printed once, with the token when there is one
+	state Reference<S3BlobStoreEndpoint> g = S3BlobStoreEndpoint::fromString(
+	    "blobstore://key:secret:tok@s3.us-west-2.amazonaws.com/fdb?bucket=b", {}, nullptr, &err, &ignored);
+	ASSERT(g->getResourceURL("fdb", "bucket=b").find("blobstore://key:secret:tok@s3.us-west-2.amazonaws.com/fdb") == 0);
+	state Reference<S3BlobStoreEndpoint> h = S3BlobStoreEndpoint::fromString(
+	    "blobstore://key:secret@s3.us-west-2.amazonaws.com/fdb?bucket=b", {}, nullptr, &err, &ignored);
+	ASSERT(h->getResourceURL("fdb", "bucket=b").find("blobstore://key:secret@s3.us-west-2.amazonaws.com/fdb") == 0);
+
+	// rejected: external_id alone, access keys together with a role, a role together with gcp_auth, a bad
+	// provider type, a role that is not an ARN
+	state std::vector<std::string> bad = {
+		"blobstore://s3.us-west-2.amazonaws.com/fdb?bucket=b&external_id=ext-1",
+		"blobstore://k:s@s3.us-west-2.amazonaws.com/fdb?bucket=b&role_arn=arn:aws:iam::1:role/r",
+		"blobstore://storage.googleapis.com/fdb?bucket=b&ga=1&role_arn=arn:aws:iam::1:role/r",
+		"blobstore://s3.us-west-2.amazonaws.com/fdb?bucket=b&credentials_provider_type=iam",
+		"blobstore://s3.us-west-2.amazonaws.com/fdb?bucket=b&role_arn=data-access"
+	};
+	state int i = 0;
+	for (; i < bad.size(); ++i) {
+		try {
+			S3BlobStoreEndpoint::fromString(bad[i], {}, nullptr, &err, &ignored);
+			ASSERT(false);
+		} catch (Error& e) {
+			ASSERT(e.code() == error_code_backup_invalid_url);
+		}
 	}
 	return Void();
 }

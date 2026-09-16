@@ -16,9 +16,12 @@ ExternalProject_Add(awssdk_project
   # it seems advice.detachedHead breaks something which causes aws sdk to always be rebuilt.
   # This option forces to cmake to build the aws sdk only once and never attempt to update it
   UPDATE_DISCONNECTED ON
+  LIST_SEPARATOR |
   CMAKE_ARGS -DBUILD_SHARED_LIBS=OFF        # SDK builds shared libs by default, we want static libs
   -DENABLE_TESTING=OFF
-  -DBUILD_ONLY=core              # git repo contains SDK for every AWS product, we only want the core auth libraries
+  # git repo contains SDK for every AWS product, we only want the core auth libraries plus STS and
+  # identity-management (with its cognito-identity dependency) for STSAssumeRoleCredentialsProvider
+  -DBUILD_ONLY=core|sts|cognito-identity|identity-management
   -DSIMPLE_INSTALL=ON
   -DCMAKE_INSTALL_PREFIX=install # need to specify an install prefix so it doesn't install in /usr/lib - FIXME: use absolute path
   -DBYO_CRYPTO=ON                # we have our own crypto libraries that conflict if we let aws sdk build and link its own
@@ -29,7 +32,10 @@ ExternalProject_Add(awssdk_project
   -DCMAKE_CXX_FLAGS=${AWSSDK_COMPILER_FLAGS}
   TEST_COMMAND ""
   # the sdk build produces a ton of artifacts, with their own dependency tree, so there is a very specific dependency order they must be linked in
-  BUILD_BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/awssdk-build/install/lib64/libaws-cpp-sdk-core.a"
+  BUILD_BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/awssdk-build/install/lib64/libaws-cpp-sdk-identity-management.a"
+  "${CMAKE_CURRENT_BINARY_DIR}/awssdk-build/install/lib64/libaws-cpp-sdk-cognito-identity.a"
+  "${CMAKE_CURRENT_BINARY_DIR}/awssdk-build/install/lib64/libaws-cpp-sdk-sts.a"
+  "${CMAKE_CURRENT_BINARY_DIR}/awssdk-build/install/lib64/libaws-cpp-sdk-core.a"
   "${CMAKE_CURRENT_BINARY_DIR}/awssdk-build/install/lib64/libaws-crt-cpp.a"
   "${CMAKE_CURRENT_BINARY_DIR}/awssdk-build/install/lib64/libaws-c-s3.a"
   "${CMAKE_CURRENT_BINARY_DIR}/awssdk-build/install/lib64/libaws-c-auth.a"
@@ -45,6 +51,18 @@ ExternalProject_Add(awssdk_project
   "${CMAKE_CURRENT_BINARY_DIR}/awssdk-build/install/external-install/curl/lib/libcurl.a"
   "${CMAKE_CURRENT_BINARY_DIR}/awssdk-build/install/external-install/zlib/lib/libz.a"
   )
+
+add_library(awssdk_identity_management STATIC IMPORTED)
+add_dependencies(awssdk_identity_management awssdk_project)
+set_target_properties(awssdk_identity_management PROPERTIES IMPORTED_LOCATION "${CMAKE_CURRENT_BINARY_DIR}/awssdk-build/install/lib64/libaws-cpp-sdk-identity-management.a")
+
+add_library(awssdk_cognito_identity STATIC IMPORTED)
+add_dependencies(awssdk_cognito_identity awssdk_project)
+set_target_properties(awssdk_cognito_identity PROPERTIES IMPORTED_LOCATION "${CMAKE_CURRENT_BINARY_DIR}/awssdk-build/install/lib64/libaws-cpp-sdk-cognito-identity.a")
+
+add_library(awssdk_sts STATIC IMPORTED)
+add_dependencies(awssdk_sts awssdk_project)
+set_target_properties(awssdk_sts PROPERTIES IMPORTED_LOCATION "${CMAKE_CURRENT_BINARY_DIR}/awssdk-build/install/lib64/libaws-cpp-sdk-sts.a")
 
 add_library(awssdk_core STATIC IMPORTED)
 add_dependencies(awssdk_core awssdk_project)
@@ -110,4 +128,4 @@ set_property(TARGET zlib PROPERTY IMPORTED_LOCATION "${CMAKE_CURRENT_BINARY_DIR}
 # link them all together in one interface target
 add_library(awssdk_target INTERFACE)
 target_include_directories(awssdk_target SYSTEM INTERFACE ${CMAKE_CURRENT_BINARY_DIR}/awssdk-build/install/include)
-target_link_libraries(awssdk_target INTERFACE awssdk_core awssdk_crt awssdk_c_s3 awssdk_c_auth awssdk_c_eventstream awssdk_c_http awssdk_c_mqtt awssdk_c_sdkutils awssdk_c_io awssdk_checksums awssdk_c_compression awssdk_c_cal awssdk_c_common curl zlib)
+target_link_libraries(awssdk_target INTERFACE awssdk_identity_management awssdk_cognito_identity awssdk_sts awssdk_core awssdk_crt awssdk_c_s3 awssdk_c_auth awssdk_c_eventstream awssdk_c_http awssdk_c_mqtt awssdk_c_sdkutils awssdk_c_io awssdk_checksums awssdk_c_compression awssdk_c_cal awssdk_c_common curl zlib)
