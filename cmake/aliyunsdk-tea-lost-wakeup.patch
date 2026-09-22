@@ -1,0 +1,88 @@
+diff --git a/include/darabonba/http/MCurlHttpClient.hpp b/include/darabonba/http/MCurlHttpClient.hpp
+index 131c92f..5b6796a 100644
+--- a/include/darabonba/http/MCurlHttpClient.hpp
++++ b/include/darabonba/http/MCurlHttpClient.hpp
+@@ -104,6 +104,9 @@ protected:
+ 
+   static bool setResponseReady(CurlStorage *curlStorage);
+ 
++  // Marks a response body as complete and wakes every thread waiting on it.
++  static void markBodyDone(MCurlResponseBody *body);
++
+   void clearQueue();
+ 
+   // Apply connection pool settings to curl multi handle
+diff --git a/src/darabonba/http/MCurlHttpClient.cpp b/src/darabonba/http/MCurlHttpClient.cpp
+index f82c9d6..926cfbb 100644
+--- a/src/darabonba/http/MCurlHttpClient.cpp
++++ b/src/darabonba/http/MCurlHttpClient.cpp
+@@ -217,6 +217,13 @@ void MCurlHttpClient::perform() {
+                     "NetworkError",
+                     std::string("Curl error: ") + curl_easy_strerror(curlResult))));
+           }
++          // The response may already have been handed out (headers or part of the body arrived
++          // before the failure); release a reader waiting for the rest instead of leaving it blocked.
++          auto body = dynamic_cast<MCurlResponseBody *>(
++              curlStorage->resp->getBody().get());
++          if (body) {
++            markBodyDone(body);
++          }
+         } else {
+           auto body = dynamic_cast<MCurlResponseBody *>(
+               curlStorage->resp->getBody().get());
+@@ -224,9 +231,7 @@ void MCurlHttpClient::perform() {
+             if (!body->getReady()) {
+               setResponseReady(curlStorage.get());
+             }
+-            body->done_ = true;
+-            body->streamCV_.notify_one();
+-            body->doneCV_.notify_one();
++            markBodyDone(body);
+           } else {
+             // This should never happen - log as error if DEBUG is enabled
+             if (nullptr != getenv("DEBUG")) {
+@@ -332,6 +337,20 @@ bool MCurlHttpClient::addContinueReadingHandle(CURL *easyHandle) {
+   return true;
+ }
+ 
++void MCurlHttpClient::markBodyDone(MCurlResponseBody *body) {
++  {
++    // Set done_ while holding both mutexes that guard the waits on it (read() waits on
++    // streamCV_ under streamMutex_, waitForDone() on doneCV_ under doneMutex_). Without the
++    // locks a notification sent between a waiter's predicate check and its sleep is lost and
++    // the waiter never wakes up: the reader thread hangs forever after the transfer finished.
++    std::lock_guard<std::mutex> streamLock(body->streamMutex_);
++    std::lock_guard<std::mutex> doneLock(body->doneMutex_);
++    body->done_ = true;
++  }
++  body->streamCV_.notify_all();
++  body->doneCV_.notify_all();
++}
++
+ bool MCurlHttpClient::setResponseReady(CurlStorage *curlStorage) {
+   // Null pointer guard
+   if (!curlStorage) {
+diff --git a/src/darabonba/http/MCurlResponse.cpp b/src/darabonba/http/MCurlResponse.cpp
+index 85fb29e..bac6c6c 100644
+--- a/src/darabonba/http/MCurlResponse.cpp
++++ b/src/darabonba/http/MCurlResponse.cpp
+@@ -60,9 +60,16 @@ bool MCurlResponseBody::fetch() {
+ }
+ 
+ size_t MCurlResponseBody::write(char *buffer, size_t expectSize) {
+-  std::lock_guard<Lock::SpinLock> lock(bufferlock_);
+-  buffer_.write(buffer, expectSize);
+-  readableSize_ += expectSize;
++  {
++    std::lock_guard<Lock::SpinLock> lock(bufferlock_);
++    buffer_.write(buffer, expectSize);
++  }
++  {
++    // Publish under streamMutex_: read() checks its predicate while holding that mutex, so a
++    // reader that has just seen no data cannot miss this notification and block forever.
++    std::lock_guard<std::mutex> lock(streamMutex_);
++    readableSize_ += expectSize;
++  }
+   streamCV_.notify_one();  // 通知等待的消费者线程
+   return expectSize;
+ }

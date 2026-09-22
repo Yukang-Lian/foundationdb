@@ -29,14 +29,23 @@ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/BuildFlags.h.in ${CMAKE_CURRENT_BINAR
 
 set(BUILD_GCP_BACKUP OFF CACHE BOOL "Build Google Cloud credential support (gcp_auth) for blobstore backups")
 if(BUILD_GCP_BACKUP)
-  if(NOT WITH_AWS_BACKUP)
-    message(FATAL_ERROR "BUILD_GCP_BACKUP requires BUILD_AWS_BACKUP=ON (it reuses the libcurl built with the AWS SDK)")
-  endif()
   add_compile_definitions(WITH_GCP_BACKUP)
   set(FDBCLIENT_SRCS ${FDBCLIENT_SRCS} GcpTokenProvider.cpp)
 endif()
 
+set(BUILD_ALIYUN_BACKUP OFF CACHE BOOL "Build Alibaba Cloud credential support (aliyun_auth) for blobstore backups")
+if(BUILD_ALIYUN_BACKUP)
+  add_compile_definitions(WITH_ALIYUN_BACKUP)
+  set(FDBCLIENT_SRCS ${FDBCLIENT_SRCS} AliyunCredentialProvider.cpp)
+endif()
+
 set(BUILD_AZURE_BACKUP OFF CACHE BOOL "Build Azure backup client")
+
+# One static libcurl for every cloud SDK and azure-storage-cpplite (see cmake/fdbcurl.cmake).
+if(WITH_AWS_BACKUP OR BUILD_AZURE_BACKUP OR BUILD_GCP_BACKUP OR BUILD_ALIYUN_BACKUP)
+  include(fdbcurl)
+endif()
+
 if(BUILD_AZURE_BACKUP)
   add_compile_definitions(BUILD_AZURE_BACKUP)
   set(FDBCLIENT_SRCS
@@ -73,36 +82,28 @@ if(BUILD_AZURE_BACKUP)
     message(FATAL_ERROR "Build step for AzureStorage has Failed. ${results}")
   endif()
 
+  # azure-storage-cpplite's find_package(CURL) picks up the static libcurl from fdbcurl.cmake
+  set(CURL_DIR "${FDBCURL_CONFIG_DIR}")
   add_subdirectory(
     ${CMAKE_CURRENT_BINARY_DIR}/azurestorage-src
     ${CMAKE_CURRENT_BINARY_DIR}/azurestorage-build
   )
+  unset(CURL_DIR)
+  add_dependencies(azure-storage-lite fdbcurl_project)
 endif()
 
 
 if(WITH_AWS_BACKUP)
   add_compile_definitions(WITH_AWS_BACKUP)
   include(awssdk)
-
-  # The AWS SDK build produces a static libcurl that fdbclient links as the `curl` target.  The
-  # Azure and Google SDKs need a libcurl newer than the build image's (7.29 lacks
-  # CURLINFO_ACTIVESOCKET and friends), so this CURL config package hands them the same one and a
-  # second libcurl never enters the binary.  The headers only exist once awssdk_project has built,
-  # hence the pre-created include directory and the dependencies declared by the consumers.
-  set(AWSSDK_CURL_ROOT "${CMAKE_CURRENT_BINARY_DIR}/awssdk-build/install/external-install/curl")
-  set(AWSSDK_CURL_CONFIG_DIR "${CMAKE_CURRENT_BINARY_DIR}/awssdk-curl")
-  file(MAKE_DIRECTORY "${AWSSDK_CURL_ROOT}/include")
-  file(WRITE "${AWSSDK_CURL_CONFIG_DIR}/CURLConfig.cmake"
-    "add_library(CURL::libcurl STATIC IMPORTED)\n"
-    "set_target_properties(CURL::libcurl PROPERTIES IMPORTED_LOCATION \"${AWSSDK_CURL_ROOT}/lib/libcurl.a\" INTERFACE_INCLUDE_DIRECTORIES \"${AWSSDK_CURL_ROOT}/include\")\n"
-    "set(CURL_FOUND TRUE)\n"
-    "set(CURL_VERSION_STRING \"awssdk\")\n"
-    "set(CURL_INCLUDE_DIRS \"${AWSSDK_CURL_ROOT}/include\")\n"
-    "set(CURL_LIBRARIES CURL::libcurl)\n")
 endif()
 
 if(BUILD_GCP_BACKUP)
   include(gcpsdk)
+endif()
+
+if(BUILD_ALIYUN_BACKUP)
+  include(aliyunsdk)
 endif()
 
 if(BUILD_AZURE_BACKUP)
@@ -146,10 +147,8 @@ if(BUILD_AZURE_BACKUP)
   # Makes azure-identity link the in-tree azure-core target instead of find_package()ing it.
   set(AZ_ALL_LIBRARIES ON)
 
-  if(WITH_AWS_BACKUP)
-    # azure-core's find_package(CURL) picks up the AWS-built libcurl (see above).
-    set(CURL_DIR "${AWSSDK_CURL_CONFIG_DIR}")
-  endif()
+  # azure-core's find_package(CURL) picks up the static libcurl from fdbcurl.cmake
+  set(CURL_DIR "${FDBCURL_CONFIG_DIR}")
 
   add_subdirectory(
     ${CMAKE_CURRENT_BINARY_DIR}/azuresdk-src/sdk/core/azure-core
@@ -160,10 +159,8 @@ if(BUILD_AZURE_BACKUP)
     ${CMAKE_CURRENT_BINARY_DIR}/azuresdk-build/azure-identity
   )
 
-  if(WITH_AWS_BACKUP)
-    unset(CURL_DIR)
-    add_dependencies(azure-core awssdk_project)
-  endif()
+  unset(CURL_DIR)
+  add_dependencies(azure-core fdbcurl_project)
 endif()
 
 add_flow_target(STATIC_LIBRARY NAME fdbclient SRCS ${FDBCLIENT_SRCS} ADDL_SRCS ${options_srcs})
@@ -202,4 +199,11 @@ if(BUILD_GCP_BACKUP)
   target_link_libraries(fdbclient_sampling PUBLIC gcpsdk_target)
   add_dependencies(fdbclient gcpsdk_project)
   add_dependencies(fdbclient_sampling gcpsdk_project)
+endif()
+
+if(BUILD_ALIYUN_BACKUP)
+  target_link_libraries(fdbclient PUBLIC aliyunsdk_target)
+  target_link_libraries(fdbclient_sampling PUBLIC aliyunsdk_target)
+  add_dependencies(fdbclient aliyunsdk_project)
+  add_dependencies(fdbclient_sampling aliyunsdk_project)
 endif()

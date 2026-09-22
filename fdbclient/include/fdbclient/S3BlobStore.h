@@ -31,6 +31,7 @@
 #include "fdbrpc/HTTP.h"
 #include "fdbrpc/Stats.h"
 #include "fdbclient/JSONDoc.h"
+#include "fdbclient/AliyunCredentialProvider.h"
 #include "fdbclient/FDBAWSCredentialsProvider.h"
 #include "fdbclient/GcpTokenProvider.h"
 #include "flow/IConnection.h"
@@ -149,7 +150,7 @@ public:
 		    concurrent_uploads, concurrent_lists, concurrent_reads_per_file, concurrent_writes_per_file,
 		    enable_read_cache, read_block_size, read_ahead_blocks, read_cache_blocks_per_file,
 		    max_send_bytes_per_second, max_recv_bytes_per_second, sdk_auth, global_connection_pool,
-		    max_delay_retryable_error, max_delay_connection_failed, gcp_auth;
+		    max_delay_retryable_error, max_delay_connection_failed, gcp_auth, aliyun_auth;
 
 		bool set(StringRef name, int value);
 		std::string getURLParameters() const;
@@ -193,11 +194,19 @@ public:
 				"WEB_IDENTITY|CONTAINER|INSTANCE_PROFILE (which SDK provider supplies the base credentials) refine "
 				"it and imply sdk_auth=1.",
 				"global_connection_pool (or gcp)       Enable shared connection pool between all blobstore instances.",
-				"gcp_auth (or ga)                      Set 1 to authenticate with OAuth2 access tokens from the Google Cloud "
+				"gcp_auth (or ga)                      Set 1 to authenticate with OAuth2 access tokens from the Google "
+				"Cloud "
 				"SDK instead of HMAC keys. Google Cloud Storage only; needs a build with BUILD_GCP_BACKUP. The string "
 				"parameters gcp_credential_provider_type=DEFAULT|COMPUTE_ENGINE (application default credentials, or "
 				"only the GCE/GKE metadata server) and gcp_impersonation_service_account=<email> (act as that service "
-				"account) refine it and imply gcp_auth=1."
+				"account) refine it and imply gcp_auth=1.",
+				"aliyun_auth (or aa)                   Set 1 to resolve Alibaba Cloud credentials with the Alibaba "
+				"Cloud "
+				"Credentials SDK (ECS RAM role, ACK RRSA, environment variables) instead of writing AK/SK into the "
+				"URL. "
+				"Alibaba Cloud OSS only; needs a build with BUILD_ALIYUN_BACKUP. "
+				"aliyun_credential_provider_type=DEFAULT|ENV|ECS_RAM_ROLE|OIDC_ROLE_ARN pins the source and implies "
+				"aliyun_auth=1."
 			};
 		}
 
@@ -314,6 +323,8 @@ public:
 	GcpCredentialConfig gcpCredentials;
 	// From the role_arn, external_id and credentials_provider_type URL parameters (sdk_auth), plus the region.
 	AwsCredentialConfig awsCredentials;
+	// From the aliyun_credential_provider_type URL parameter (aliyun_auth).
+	AliyunCredentialConfig aliyunCredentials;
 
 	// Speed and concurrency limits
 	Reference<IRateControl> requestRate;

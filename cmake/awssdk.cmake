@@ -5,6 +5,8 @@ set(AWSSDK_COMPILER_FLAGS "")
 if(APPLE OR USE_LIBCXX)
   set(AWSSDK_COMPILER_FLAGS "-stdlib=libc++ -nostdlib++")
 endif()
+# The SDK builds with -Werror and uses options (CURLOPT_PUT) that the libcurl from fdbcurl.cmake marks deprecated.
+set(AWSSDK_COMPILER_FLAGS "${AWSSDK_COMPILER_FLAGS} -DCURL_DISABLE_DEPRECATION")
 
 include(ExternalProject)
 ExternalProject_Add(awssdk_project
@@ -16,6 +18,8 @@ ExternalProject_Add(awssdk_project
   # it seems advice.detachedHead breaks something which causes aws sdk to always be rebuilt.
   # This option forces to cmake to build the aws sdk only once and never attempt to update it
   UPDATE_DISCONNECTED ON
+  # libcurl comes from fdbcurl.cmake (the SDK's own would be 7.52, too old for the other SDKs)
+  DEPENDS fdbcurl_project
   LIST_SEPARATOR |
   CMAKE_ARGS -DBUILD_SHARED_LIBS=OFF        # SDK builds shared libs by default, we want static libs
   -DENABLE_TESTING=OFF
@@ -25,7 +29,8 @@ ExternalProject_Add(awssdk_project
   -DSIMPLE_INSTALL=ON
   -DCMAKE_INSTALL_PREFIX=install # need to specify an install prefix so it doesn't install in /usr/lib - FIXME: use absolute path
   -DBYO_CRYPTO=ON                # we have our own crypto libraries that conflict if we let aws sdk build and link its own
-  -DBUILD_CURL=ON
+  -DBUILD_CURL=OFF
+  -DCURL_DIR=${FDBCURL_CONFIG_DIR}
   -DBUILD_ZLIB=ON
 
   -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
@@ -48,7 +53,6 @@ ExternalProject_Add(awssdk_project
   "${CMAKE_CURRENT_BINARY_DIR}/awssdk-build/install/lib64/libaws-c-compression.a"
   "${CMAKE_CURRENT_BINARY_DIR}/awssdk-build/install/lib64/libaws-c-cal.a"
   "${CMAKE_CURRENT_BINARY_DIR}/awssdk-build/install/lib64/libaws-c-common.a"
-  "${CMAKE_CURRENT_BINARY_DIR}/awssdk-build/install/external-install/curl/lib/libcurl.a"
   "${CMAKE_CURRENT_BINARY_DIR}/awssdk-build/install/external-install/zlib/lib/libz.a"
   )
 
@@ -116,10 +120,6 @@ set_target_properties(awssdk_c_cal PROPERTIES IMPORTED_LOCATION "${CMAKE_CURRENT
 add_library(awssdk_c_common STATIC IMPORTED)
 add_dependencies(awssdk_c_common awssdk_project)
 set_target_properties(awssdk_c_common PROPERTIES IMPORTED_LOCATION "${CMAKE_CURRENT_BINARY_DIR}/awssdk-build/install/lib64/libaws-c-common.a")
-
-add_library(curl STATIC IMPORTED)
-add_dependencies(curl awssdk_project)
-set_property(TARGET curl PROPERTY IMPORTED_LOCATION "${CMAKE_CURRENT_BINARY_DIR}/awssdk-build/install/external-install/curl/lib/libcurl.a")
 
 add_library(zlib STATIC IMPORTED)
 add_dependencies(zlib awssdk_project)

@@ -1,0 +1,2 @@
+# a diff of tea-cpp: its blank context lines are a single space, which is not stray whitespace
+cmake/aliyunsdk-tea-lost-wakeup.patch -whitespace

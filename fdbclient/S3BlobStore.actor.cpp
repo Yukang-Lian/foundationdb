@@ -24,6 +24,7 @@
 #include "md5/md5.h"
 #include "libb64/encode.h"
 #include "fdbclient/sha1/SHA1.h"
+#include <atomic>
 #include <climits>
 #include <time.h>
 #include <iomanip>
@@ -99,6 +100,7 @@ S3BlobStoreEndpoint::BlobKnobs::BlobKnobs() {
 	max_delay_connection_failed = CLIENT_KNOBS->BLOBSTORE_MAX_DELAY_CONNECTION_FAILED;
 	sdk_auth = false;
 	gcp_auth = false;
+	aliyun_auth = false;
 	global_connection_pool = CLIENT_KNOBS->BLOBSTORE_GLOBAL_CONNECTION_POOL;
 }
 
@@ -141,6 +143,7 @@ bool S3BlobStoreEndpoint::BlobKnobs::set(StringRef name, int value) {
 	TRY_PARAM(max_delay_connection_failed, dcf);
 	TRY_PARAM(sdk_auth, sa);
 	TRY_PARAM(gcp_auth, ga);
+	TRY_PARAM(aliyun_auth, aa);
 	TRY_PARAM(global_connection_pool, gcp);
 #undef TRY_PARAM
 	return false;
@@ -181,6 +184,7 @@ std::string S3BlobStoreEndpoint::BlobKnobs::getURLParameters() const {
 	_CHECK_PARAM(max_recv_bytes_per_second, rbps);
 	_CHECK_PARAM(sdk_auth, sa);
 	_CHECK_PARAM(gcp_auth, ga);
+	_CHECK_PARAM(aliyun_auth, aa);
 	_CHECK_PARAM(global_connection_pool, gcp);
 	_CHECK_PARAM(max_delay_retryable_error, dre);
 	_CHECK_PARAM(max_delay_connection_failed, dcf);
@@ -278,6 +282,8 @@ Reference<S3BlobStoreEndpoint> S3BlobStoreEndpoint::fromString(const std::string
 		bool gcpCredentialParams = false;
 		AwsCredentialConfig awsCredentials;
 		bool awsCredentialParams = false;
+		AliyunCredentialConfig aliyunCredentials;
+		bool aliyunCredentialParams = false;
 		while (1) {
 			StringRef name = t.eat("=");
 			if (name.size() == 0)
@@ -346,6 +352,17 @@ Reference<S3BlobStoreEndpoint> S3BlobStoreEndpoint::fromString(const std::string
 					             value.toString().c_str());
 				}
 				awsCredentialParams = true;
+				continue;
+			}
+			// Alibaba Cloud credential setting for aliyun_auth. BE has no keyless mode for OSS yet; the value names
+			// follow the Alibaba Cloud Credentials SDK.
+			if (name == "aliyun_credential_provider_type"_sr) {
+				if (!parseAliyunCredentialProviderType(value.toString(), &aliyunCredentials.providerType)) {
+					throw format("'%s' is not a valid value for aliyun_credential_provider_type, expected DEFAULT, "
+					             "ENV, ECS_RAM_ROLE or OIDC_ROLE_ARN",
+					             value.toString().c_str());
+				}
+				aliyunCredentialParams = true;
 				continue;
 			}
 			if (name == "gcp_impersonation_service_account"_sr) {
@@ -430,6 +447,20 @@ Reference<S3BlobStoreEndpoint> S3BlobStoreEndpoint::fromString(const std::string
 			}
 			knobs.sdk_auth = 1;
 		}
+		// The Alibaba Cloud credential parameter selects aliyun_auth by itself; the SDK-resolved credentials sign
+		// requests like AK/SK, so the region is still needed and the URL must not carry keys.
+		if (aliyunCredentialParams) {
+			knobs.aliyun_auth = 1;
+		}
+		if (knobs.aliyun_auth) {
+			if (creds.present()) {
+				throw std::string(
+				    "aliyun_auth resolves credentials with the Alibaba Cloud SDK, remove the credentials from the URL");
+			}
+			if (knobs.gcp_auth || knobs.sdk_auth) {
+				throw std::string("aliyun_auth cannot be combined with gcp_auth, sdk_auth or their parameters");
+			}
+		}
 
 		// Bearer token auth does not sign requests, so it needs no region.
 		if (region.empty() && CLIENT_KNOBS->HTTP_REQUEST_AWS_V4_HEADER && !knobs.gcp_auth) {
@@ -442,6 +473,7 @@ Reference<S3BlobStoreEndpoint> S3BlobStoreEndpoint::fromString(const std::string
 		endpoint->gcpCredentials = gcpCredentials;
 		endpoint->awsCredentials = awsCredentials;
 		endpoint->awsCredentials.region = region;
+		endpoint->aliyunCredentials = aliyunCredentials;
 		return endpoint;
 
 	} catch (std::string& err) {
@@ -467,7 +499,7 @@ std::string S3BlobStoreEndpoint::getResourceURL(std::string resource, std::strin
 	// Credentials resolved by the cloud SDKs (sdk_auth, gcp_auth) never appear: they are temporary and belong to the
 	// machine's identity, not to the URL.
 	std::string credsString;
-	if (credentials.present() && !knobs.sdk_auth && !knobs.gcp_auth) {
+	if (credentials.present() && !knobs.sdk_auth && !knobs.gcp_auth && !knobs.aliyun_auth) {
 		if (!lookupKey) {
 			credsString = credentials.get().key;
 		}
@@ -514,6 +546,15 @@ std::string S3BlobStoreEndpoint::getResourceURL(std::string resource, std::strin
 			params.append("external_id=");
 			params.append(awsCredentials.externalId);
 		}
+	}
+
+	// Alibaba Cloud credential settings that deviate from their defaults
+	if (knobs.aliyun_auth && aliyunCredentials.providerType != AliyunCredentialProviderType::DEFAULT) {
+		if (!params.empty()) {
+			params.append("&");
+		}
+		params.append("aliyun_credential_provider_type=");
+		params.append(aliyunCredentialProviderTypeName(aliyunCredentials.providerType));
 	}
 
 	// Google Cloud credential settings that deviate from their defaults
@@ -797,6 +838,41 @@ AsyncTaskThread& credentialThread() {
 	return *thread;
 }
 
+// A fetch that never returns (an SDK bug, a wedged HTTP client) keeps the credential thread and so every later
+// fetch of the process, which only shows as endless request timeouts while the backup silently stalls. The
+// thread records when a fetch starts and finishes; when a new fetch is requested while one has been running far
+// longer than the SDKs' own timeouts allow, the process reports it and exits so its supervisor restarts it with
+// fresh SDK state.
+namespace {
+constexpr double CREDENTIAL_FETCH_STUCK_SECONDS = 300;
+std::atomic<double> credentialFetchStartedAt{ 0 }; // timer_monotonic() of the running fetch, 0 when idle
+} // namespace
+
+template <class F>
+Future<decltype(std::declval<F>()())> fetchCredentials(const F& func) {
+	double startedAt = credentialFetchStartedAt.load();
+	if (startedAt != 0 && timer_monotonic() - startedAt > CREDENTIAL_FETCH_STUCK_SECONDS) {
+		criticalError(FDB_EXIT_ERROR,
+		              "CredentialFetchStuck",
+		              format("A cloud credential fetch has been running for %.0f seconds, so the credential thread "
+		                     "is stuck and no blobstore connection can be authenticated. Exiting so the process "
+		                     "can be restarted.",
+		                     timer_monotonic() - startedAt)
+		                  .c_str());
+	}
+	return credentialThread().execAsync([func] {
+		credentialFetchStartedAt.store(timer_monotonic());
+		try {
+			auto result = func();
+			credentialFetchStartedAt.store(0);
+			return result;
+		} catch (...) {
+			credentialFetchStartedAt.store(0);
+			throw;
+		}
+	});
+}
+
 // Obtains a bearer token for Google Cloud Storage through the Google Cloud SDK, from the source credential
 // selected by gcp_credential_provider_type (application default credentials or only the GCE/GKE metadata server),
 // optionally exchanged for a token of the impersonated service account.
@@ -808,7 +884,7 @@ ACTOR Future<Void> refreshBearerToken_impl(Reference<S3BlobStoreEndpoint> b) {
 		try {
 			// a plain copy for the lambda: state variables live in the actor object and cannot be captured
 			GcpCredentialConfig cfg = config;
-			GcpAccessToken token = wait(credentialThread().execAsync([cfg] { return fetchGcpStorageToken(cfg); }));
+			GcpAccessToken token = wait(fetchCredentials([cfg] { return fetchGcpStorageToken(cfg); }));
 			b->bearerToken = token.token;
 			b->bearerTokenExpiration = now() + token.expiresIn;
 			b->bearerTokenRefreshNotBefore = now() + 30;
@@ -870,9 +946,51 @@ void S3BlobStoreEndpoint::setBearerAuthHeaders(HTTP::Headers& headers) {
 	headers["Authorization"] = "Bearer " + bearerToken;
 }
 
+// Runs on the credential thread (the SDK blocks on the metadata service or STS), so no TraceEvents here.
+static AliyunCredentials getSecretAliyun(const AliyunCredentialConfig& config) {
+#ifdef WITH_ALIYUN_BACKUP
+	return fetchAliyunCredentials(config);
+#else
+	fprintf(stderr, "ERROR: aliyun_auth requires a build with BUILD_ALIYUN_BACKUP=ON.\n");
+	throw backup_auth_missing();
+#endif
+}
+
 ACTOR Future<Void> updateSecret_impl(Reference<S3BlobStoreEndpoint> b) {
 	if (b->knobs.gcp_auth) {
 		wait(b->ensureBearerToken());
+		return Void();
+	}
+	if (b->knobs.aliyun_auth) {
+		state AliyunCredentialConfig aliyunConfig = b->aliyunCredentials;
+		state double aliyunStart = timer_monotonic();
+		try {
+			// a plain copy for the lambda: state variables live in the actor object and cannot be captured
+			AliyunCredentialConfig cfg = aliyunConfig;
+			AliyunCredentials creds = wait(fetchCredentials([cfg] { return getSecretAliyun(cfg); }));
+			S3BlobStoreEndpoint::Credentials fdbCreds;
+			fdbCreds.key = creds.key;
+			fdbCreds.secret = creds.secret;
+			fdbCreds.securityToken = creds.token;
+			b->credentials = fdbCreds;
+			TraceEvent("S3BlobStoreGotAliyunCredentials")
+			    .suppressFor(60)
+			    .detail("Duration", timer_monotonic() - aliyunStart)
+			    .detail("KeyIdSuffix", creds.key.size() > 4 ? creds.key.substr(creds.key.size() - 4) : creds.key)
+			    .detail("CredentialProviderType", aliyunCredentialProviderTypeName(aliyunConfig.providerType))
+			    .detail("CredentialSource", aliyunCredentialProviderTypeName(creds.source));
+		} catch (Error& e) {
+			if (e.code() == error_code_backup_auth_missing) {
+				TraceEvent(SevWarn, "S3BlobStoreAliyunCredsEmpty")
+				    .detail("CredentialProviderType", aliyunCredentialProviderTypeName(aliyunConfig.providerType));
+				fprintf(stderr,
+				        "ERROR: The Alibaba Cloud SDK returned no credentials for aliyun_auth (provider %s). This "
+				        "needs an ECS instance RAM role, ACK RRSA variables, or ALIBABA_CLOUD_ACCESS_KEY_ID and "
+				        "ALIBABA_CLOUD_ACCESS_KEY_SECRET in the environment of every fdbbackup and backup_agent.\n",
+				        aliyunCredentialProviderTypeName(aliyunConfig.providerType));
+			}
+			throw;
+		}
 		return Void();
 	}
 	if (b->knobs.sdk_auth) {
@@ -881,8 +999,7 @@ ACTOR Future<Void> updateSecret_impl(Reference<S3BlobStoreEndpoint> b) {
 		try {
 			// a plain copy for the lambda: state variables live in the actor object and cannot be captured
 			AwsCredentialConfig cfg = awsConfig;
-			S3BlobStoreEndpoint::Credentials creds =
-			    wait(credentialThread().execAsync([cfg] { return getSecretSdk(cfg); }));
+			S3BlobStoreEndpoint::Credentials creds = wait(fetchCredentials([cfg] { return getSecretSdk(cfg); }));
 			b->credentials = creds;
 			TraceEvent("S3BlobStoreGotSdkCredentials")
 			    .suppressFor(60)
@@ -1034,7 +1151,7 @@ ACTOR Future<S3BlobStoreEndpoint::ReusableConnection> connect_impl(Reference<S3B
 	    .detail("ExpiresIn", b->knobs.max_connection_life)
 	    .detail("Proxy", b->proxyHost.orDefault(""));
 
-	if (b->lookupKey || b->lookupSecret || b->knobs.sdk_auth || b->knobs.gcp_auth)
+	if (b->lookupKey || b->lookupSecret || b->knobs.sdk_auth || b->knobs.gcp_auth || b->knobs.aliyun_auth)
 		wait(b->updateSecret());
 
 	return S3BlobStoreEndpoint::ReusableConnection({ conn, now() + b->knobs.max_connection_life });
@@ -1262,7 +1379,7 @@ ACTOR Future<Reference<HTTP::IncomingResponse>> doRequest_impl(Reference<S3BlobS
 		bool retryable = err.present() || r->code == 500 || r->code == 502 || r->code == 503 || r->code == 429;
 		// Not being able to get credentials from the cloud SDK (metadata server, STS AssumeRole, credential files) is
 		// a deployment problem that retries will not fix.
-		if ((bstore->knobs.gcp_auth || bstore->knobs.sdk_auth) && err.present() &&
+		if ((bstore->knobs.gcp_auth || bstore->knobs.sdk_auth || bstore->knobs.aliyun_auth) && err.present() &&
 		    err.get().code() == error_code_backup_auth_missing)
 			retryable = false;
 
@@ -2338,6 +2455,63 @@ TEST_CASE("/backup/s3/aws_role_url") {
 		"blobstore://storage.googleapis.com/fdb?bucket=b&ga=1&role_arn=arn:aws:iam::1:role/r",
 		"blobstore://s3.us-west-2.amazonaws.com/fdb?bucket=b&credentials_provider_type=iam",
 		"blobstore://s3.us-west-2.amazonaws.com/fdb?bucket=b&role_arn=data-access"
+	};
+	state int i = 0;
+	for (; i < bad.size(); ++i) {
+		try {
+			S3BlobStoreEndpoint::fromString(bad[i], {}, nullptr, &err, &ignored);
+			ASSERT(false);
+		} catch (Error& e) {
+			ASSERT(e.code() == error_code_backup_invalid_url);
+		}
+	}
+	return Void();
+}
+
+TEST_CASE("/backup/s3/aliyun_auth_url") {
+	state std::string err;
+	state S3BlobStoreEndpoint::ParametersT ignored;
+
+	// aliyun_auth signs with SDK-resolved keys, so the region is still required and survives a URL round trip
+	state Reference<S3BlobStoreEndpoint> b = S3BlobStoreEndpoint::fromString(
+	    "blobstore://b.oss-cn-beijing.aliyuncs.com/fdb?bucket=b&region=oss-cn-beijing&aliyun_auth=1",
+	    {},
+	    nullptr,
+	    &err,
+	    &ignored);
+	ASSERT(b->knobs.aliyun_auth == 1);
+	ASSERT(!b->credentials.present());
+	ASSERT(b->aliyunCredentials.providerType == AliyunCredentialProviderType::DEFAULT);
+	ASSERT(b->getResourceURL("fdb", "bucket=b").find("aa=1") != std::string::npos);
+	ASSERT(b->getResourceURL("fdb", "bucket=b").find("aliyun_credential_provider_type") == std::string::npos);
+
+	// the provider type implies aliyun_auth, is case-insensitive and is printed back
+	state Reference<S3BlobStoreEndpoint> c =
+	    S3BlobStoreEndpoint::fromString("blobstore://b.oss-cn-beijing.aliyuncs.com/fdb?bucket=b&region=oss-cn-beijing"
+	                                    "&aliyun_credential_provider_type=ecs_ram_role",
+	                                    {},
+	                                    nullptr,
+	                                    &err,
+	                                    &ignored);
+	ASSERT(c->knobs.aliyun_auth == 1);
+	ASSERT(c->aliyunCredentials.providerType == AliyunCredentialProviderType::ECS_RAM_ROLE);
+	state std::string roundTrip = c->getResourceURL("fdb", "bucket=b");
+	ASSERT(roundTrip.find("aliyun_credential_provider_type=ECS_RAM_ROLE") != std::string::npos);
+	state Reference<S3BlobStoreEndpoint> d = S3BlobStoreEndpoint::fromString(roundTrip, {}, nullptr, &err, &ignored);
+	ASSERT(d->aliyunCredentials.providerType == AliyunCredentialProviderType::ECS_RAM_ROLE);
+	// credentials the SDK resolved later are not printed into the URL
+	d->credentials = S3BlobStoreEndpoint::Credentials{ "STS.KEY", "secret", "token" };
+	ASSERT(d->getResourceURL("fdb", "bucket=b").find("@") == std::string::npos);
+
+	// rejected: access keys together with aliyun_auth, a bad provider type, mixing with gcp_auth or sdk_auth
+	state std::vector<std::string> bad = {
+		"blobstore://k:s@b.oss-cn-beijing.aliyuncs.com/fdb?bucket=b&region=oss-cn-beijing&aliyun_auth=1",
+		"blobstore://b.oss-cn-beijing.aliyuncs.com/"
+		"fdb?bucket=b&region=oss-cn-beijing&aliyun_credential_provider_type=ram",
+		"blobstore://b.oss-cn-beijing.aliyuncs.com/fdb?bucket=b&region=oss-cn-beijing&aliyun_auth=1&gcp_auth=1",
+		"blobstore://b.oss-cn-beijing.aliyuncs.com/fdb?bucket=b&region=oss-cn-beijing&aliyun_auth=1&sa=1",
+		"blobstore://b.oss-cn-beijing.aliyuncs.com/"
+		"fdb?bucket=b&region=oss-cn-beijing&aliyun_auth=1&role_arn=arn:aws:iam::1:role/r"
 	};
 	state int i = 0;
 	for (; i < bad.size(); ++i) {

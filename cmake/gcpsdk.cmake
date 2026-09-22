@@ -31,7 +31,7 @@ set(GCPSDK_COMMON_ARGS
   -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
   -DCMAKE_CXX_FLAGS=${GCPSDK_COMPILER_FLAGS}
   -DCMAKE_PREFIX_PATH=${GCPSDK_INSTALL}
-  -DCURL_DIR=${AWSSDK_CURL_CONFIG_DIR}
+  -DCURL_DIR=${FDBCURL_CONFIG_DIR}
   -DOPENSSL_ROOT_DIR=${OPENSSL_ROOT_DIR})
 
 # Static libraries needed to link google-cloud-cpp::oauth2, dependents first (derived from the
@@ -80,7 +80,7 @@ ExternalProject_Add(gcpsdk_project
   GIT_SHALLOW TRUE
   GIT_CONFIG advice.detachedHead=false
   UPDATE_DISCONNECTED ON
-  DEPENDS gcpsdk_abseil gcpsdk_json awssdk_project
+  DEPENDS gcpsdk_abseil gcpsdk_json fdbcurl_project
   SOURCE_DIR "${CMAKE_CURRENT_BINARY_DIR}/gcpsdk-src"
   BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/gcpsdk-build"
   CMAKE_ARGS ${GCPSDK_COMMON_ARGS} -DGOOGLE_CLOUD_CPP_ENABLE=oauth2 -DBUILD_TESTING=OFF

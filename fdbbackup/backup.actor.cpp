@@ -22,6 +22,7 @@
 #include "fmt/format.h"
 #include "fdbbackup/BackupTLSConfig.h"
 #include "fdbbackup/Decode.h"
+#include "fdbclient/SystemCaBundle.h"
 #include "fdbclient/JsonBuilder.h"
 #include "flow/Arena.h"
 #include "flow/ArgParseUtil.h"
@@ -3271,6 +3272,16 @@ Optional<Database> connectToCluster(std::string const& clusterFile,
 };
 
 int main(int argc, char* argv[]) {
+	// The static libcurl of the cloud SDKs has no compiled-in CA bundle and falls back to OpenSSL's default
+	// paths, which honour SSL_CERT_FILE. Point them at the host's bundle for SDK code that sets no CA file
+	// itself (the Alibaba Cloud SDK); set before any thread starts.
+	if (getenv("SSL_CERT_FILE") == nullptr) {
+		std::string caBundle = systemCaBundle();
+		if (!caBundle.empty()) {
+			setenv("SSL_CERT_FILE", caBundle.c_str(), 0);
+		}
+	}
+
 	platformInit();
 
 	int status = FDB_EXIT_SUCCESS;
